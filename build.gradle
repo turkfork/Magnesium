@@ -1,0 +1,121 @@
+plugins {
+	id 'net.fabricmc.fabric-loom-remap' version "${loom_version}"
+	id 'maven-publish'
+}
+
+repositories {
+	// Add repositories to retrieve artifacts from in here.
+	// You should only use this when depending on other mods because
+	// Loom adds the essential Maven repositories to download Minecraft and libraries from automatically.
+}
+
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		"magnesium" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings loom.officialMojangMappings()
+
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// Sodium 0.5.11
+	modImplementation files("libs/sodium.jar")
+}
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 17
+}
+
+java {
+	withSourcesJar()
+
+	sourceCompatibility = JavaVersion.VERSION_17
+	targetCompatibility = JavaVersion.VERSION_17
+}
+
+jar {
+	def projectName = project.name
+	inputs.property "projectName", projectName
+
+	from("LICENSE") {
+		rename { "${it}_$projectName"}
+	}
+}
+
+/*
+ * Magnesium native Metal library
+ *
+ * Passes the absolute path to the native macOS library
+ * into the Minecraft JVM.
+ */
+tasks.named("runClient") {
+	jvmArgs "-Dmagnesium.native.path=${file("native/macos/libmagnesium.dylib").absolutePath}"
+
+	def metalEnabled = providers.gradleProperty("magnesium.metal.enabled").orNull
+	if (metalEnabled != null) {
+		jvmArgs "-Dmagnesium.metal.enabled=${metalEnabled}"
+	}
+
+	def metalDraw = providers.gradleProperty("magnesium.metal.draw").orNull
+	if (metalDraw == "true") {
+		/*
+		 * Routes Sodium's chunk batches through real Metal
+		 * drawIndexedPrimitives calls against an offscreen render target,
+		 * dumping the result to a PNG for verification.
+		 */
+		jvmArgs "-Dmagnesium.metal.draw=true"
+	}
+
+	/*
+	 * Enable the periodic FPS logger in the dev client for
+	 * framerate/regression measurements against Magnesium's
+	 * Metal translation seam.
+	 */
+	jvmArgs "-Dmagnesium.fps.log=true"
+}
+
+/*
+ * Sodium 0.5.11 requires LWJGL 3.3.1.
+ *
+ * Fabric Loom's development environment may otherwise resolve
+ * the LWJGL 3.3.2 snapshot used by the current mappings/setup.
+ */
+configurations.configureEach {
+	resolutionStrategy.eachDependency { details ->
+		if (details.requested.group == "org.lwjgl") {
+			details.useVersion("3.3.1")
+			details.because("Sodium 0.5.11 requires LWJGL 3.3.1")
+		}
+	}
+}
+
+// configure the maven publication
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			from components.java
+		}
+	}
+
+	repositories {
+		// Add repositories here when you are ready to publish.
+	}
+}
