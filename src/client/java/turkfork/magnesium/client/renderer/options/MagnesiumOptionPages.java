@@ -85,14 +85,55 @@ public final class MagnesiumOptionPages {
                                         MagnesiumOptions::getCaptureDelaySeconds)
                                 .build())
                         .add(OptionImpl.createBuilder(Boolean.class, STORAGE)
-                                .setName(Component.literal("Back-face culling (experimental)"))
+                                .setName(Component.literal("Back-face culling"))
                                 .setTooltip(Component.literal(
-                                        "Cull back faces in the Metal terrain pass. The winding "
-                                                + "order has not been verified against Sodium's "
-                                                + "quads yet, so faces may disappear."))
+                                        "Cull back faces in the Metal terrain pass, as vanilla "
+                                                + "does. Plants and dripstone are modelled with a "
+                                                + "quad for each side, so leaving this off draws "
+                                                + "both and causes artifacts."))
                                 .setControl(TickBoxControl::new)
                                 .setBinding(MagnesiumOptions::setCullBackFaces,
                                         MagnesiumOptions::isCullBackFaces)
+                                .build())
+                        .build(),
+                OptionGroup.createBuilder()
+                        .add(OptionImpl.createBuilder(Boolean.class, STORAGE)
+                                .setName(Component.literal("Metal terrain rendering (experimental)"))
+                                .setTooltip(Component.literal(
+                                        "Render Sodium's terrain through Metal every frame and "
+                                                + "composite it into the OpenGL framebuffer with "
+                                                + "depth, so entities and the HUD still sort "
+                                                + "correctly. Reads the frame back to the CPU, so "
+                                                + "it is slow. Requires the Metal translation. "
+                                                + "May not work with fabulous graphics."))
+                                .setControl(TickBoxControl::new)
+                                .setBinding(MagnesiumOptions::setMetalRender,
+                                        MagnesiumOptions::isMetalRender)
+                                .setImpact(OptionImpact.HIGH)
+                                .build())
+                        .add(OptionImpl.createBuilder(Boolean.class, STORAGE)
+                                .setName(Component.literal("Disable OpenGL terrain draw (experimental)"))
+                                .setTooltip(Component.literal(
+                                        "Skip Sodium's OpenGL terrain draw calls entirely. "
+                                                + "Without Metal terrain rendering also enabled, "
+                                                + "no terrain is drawn at all. Requires the "
+                                                + "Metal translation."))
+                                .setControl(TickBoxControl::new)
+                                .setBinding(MagnesiumOptions::setDisableOpenGl,
+                                        MagnesiumOptions::isDisableOpenGl)
+                                .setImpact(OptionImpact.HIGH)
+                                .build())
+                        .build(),
+                OptionGroup.createBuilder()
+                        .add(OptionImpl.createBuilder(Boolean.class, STORAGE)
+                                .setName(Component.literal("macOS menu bar integration"))
+                                .setTooltip(Component.literal(
+                                        "Rename the menu bar's \"java\" app menu to \"Minecraft\" "
+                                                + "and add a Magnesium menu with quick toggles. "
+                                                + "Requires a restart."))
+                                .setControl(TickBoxControl::new)
+                                .setBinding(MagnesiumOptions::setMenuBar,
+                                        MagnesiumOptions::isMenuBar)
                                 .build())
                         .build(),
                 OptionGroup.createBuilder()

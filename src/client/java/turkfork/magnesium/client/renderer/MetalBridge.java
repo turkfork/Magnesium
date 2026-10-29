@@ -123,6 +123,12 @@ public final class MetalBridge {
     public static native void discoverWindow();
 
     /**
+     * Re-appends the " - Magnesium" window title suffix if Minecraft has reset
+     * the title. Safe to call repeatedly.
+     */
+    public static native void refreshWindowTitle();
+
+    /**
      * @return true if the Minecraft window has been discovered
      */
     public static native boolean isWindowDiscovered();
@@ -229,6 +235,14 @@ public final class MetalBridge {
                                                  java.nio.ByteBuffer rgba);
 
     /**
+     * Uploads tightly packed RGBA8 pixels into a sub-rectangle of one mip level
+     * (used to refresh animated sprites in the atlas).
+     */
+    public static native void uploadTextureRegion(int slot, int level, int x, int y,
+                                                  int width, int height,
+                                                  java.nio.ByteBuffer rgba);
+
+    /**
      * Selects the terrain pass (0 solid, 1 cutout, 2 translucent) and supplies
      * the pass-wide uniforms: {@code [fogR, fogG, fogB, fogA, fogStart, fogEnd,
      * fogShape, texCoordShrinkX, texCoordShrinkY]}.
@@ -239,6 +253,42 @@ public final class MetalBridge {
      * Whether the next capture culls back faces (counter-clockwise front faces).
      */
     public static native void setChunkCulling(boolean cullBackFaces);
+
+    /**
+     * Frame mode: the next capture is a live per-frame render (transparent
+     * clear, depth kept) read back by {@link #endChunkFrame()} instead of a
+     * one-shot PNG dump.
+     */
+    public static native void setChunkFrameMode(boolean frameMode);
+
+    /**
+     * Ends a frame-mode capture, blitting color and depth into shared readback
+     * buffers and waiting for the GPU.
+     *
+     * @return 0 on failure, 1 if the readback buffers hold a finished frame,
+     *         2 if the IOSurface targets hold it (zero-copy)
+     */
+    public static native int endChunkFrame();
+
+    /**
+     * Asks the next frame-mode capture to render into IOSurface-backed targets
+     * that OpenGL can sample directly (no readback).
+     */
+    public static native void setFrameZeroCopy(boolean zeroCopy);
+
+    /**
+     * Binds IOSurface 0 (color) or 1 (packed depth) to the currently bound
+     * GL_TEXTURE_RECTANGLE texture of the current CGL context.
+     *
+     * @return true on success
+     */
+    public static native boolean bindFrameSurface(int which);
+
+    /**
+     * Native address of a frame readback buffer: 0 = color (RGBA8, top row
+     * first), 1 = depth (R32F, top row first). 0 if unavailable.
+     */
+    public static native long frameBufferAddress(int which);
 
     /**
      * Opens an offscreen Metal capture pass at the given size for the current
@@ -271,6 +321,22 @@ public final class MetalBridge {
      * {@code [subDraws, indices, coverageX1000, avgRX1000, avgGX1000, avgBX1000]}.
      */
     public static native long[] endChunkCapture(String pngPath);
+
+    /**
+     * Schedules, on the AppKit main thread, renaming the menu bar's app menu
+     * (GLFW titles it after the process, "java") and adding a Magnesium menu.
+     */
+    public static native void installMenuBar(String appName, String version,
+                                             String gameDir, String configDir);
+
+    /**
+     * Drains the menu actions chosen since the last call, as a bitmask of
+     * {@code 1 << action} (see {@link MagnesiumMenuBar}).
+     */
+    public static native int pollMenuActions();
+
+    /** Sets the check mark shown next to a menu action. */
+    public static native void setMenuState(int action, boolean on);
 
     /**
      * Shuts down the Metal renderer and releases native resources.

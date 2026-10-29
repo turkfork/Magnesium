@@ -15,7 +15,6 @@ import turkfork.magnesium.client.renderer.options.MagnesiumOptionPages;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Magnesium's Metal-backed implementation of Sodium's {@link RenderDevice}.
@@ -38,8 +37,9 @@ public final class MagnesiumRenderDevice implements RenderDevice {
     private final CommandList delegateCommandList;
     private final MagnesiumCommandList commandList;
     private final Map<GlBuffer, Long> bufferToMetal = new IdentityHashMap<>();
-    private final AtomicLong metalBufferCount = new AtomicLong();
-    private final AtomicLong metalBufferBytes = new AtomicLong();
+    /** Live Metal buffers: native handle -> current size in bytes. */
+    private final Map<Long, Long> metalBufferSizes = new java.util.HashMap<>();
+    private long metalBufferBytes = 0L;
     private long drawCount = 0L;
 
     /**
@@ -55,6 +55,9 @@ public final class MagnesiumRenderDevice implements RenderDevice {
     private boolean metalDrawWasEnabled = false;
     private volatile boolean captureDone = false;
     private boolean captureOpen = false;
+    private boolean captureIsFrame = false;
+    private int captureWidth = 0;
+    private int captureHeight = 0;
     private long firstDrawNano = 0L;
     private long captureStartNano = 0L;
     private long tessVertexMetal = 0L;
@@ -179,6 +182,20 @@ public final class MagnesiumRenderDevice implements RenderDevice {
         return enabled;
     }
 
+    /** Re-arms the one-shot PNG capture; a new warm-up starts at the next draw. */
+    public void rearmCapture() {
+        this.captureDone = false;
+        this.firstDrawNano = 0L;
+    }
+
+    boolean isMetalRenderEnabled() {
+        return MagnesiumOptionPages.OPTIONS.isMetalRender();
+    }
+
+    boolean isOpenGlDrawDisabled() {
+        return MagnesiumOptionPages.OPTIONS.isDisableOpenGl();
+    }
+
     boolean isMetalCaptureDone() {
         return this.captureDone;
     }
@@ -203,26 +220,38 @@ public final class MagnesiumRenderDevice implements RenderDevice {
      * after the warm-up delay, and once the atlas and light map are mirrored.
      */
     void openMetalCapture(int width, int height, float[] mvp) {
-        if (this.captureOpen || this.captureDone) {
+        if (this.captureOpen) {
+            return;
+        }
+        boolean frame = MagnesiumOptionPages.OPTIONS.isMetalRender();
+        if (!frame && this.captureDone) {
             return;
         }
         if (this.tessVertexMetal == 0L || this.tessIndexMetal == 0L) {
             return;
         }
         long now = System.nanoTime();
-        if (this.firstDrawNano == 0L) {
-            this.firstDrawNano = now;
+        if (!frame) {
+            if (this.firstDrawNano == 0L) {
+                this.firstDrawNano = now;
+            }
+            if (MagnesiumPassHook.kind() != MagnesiumPassHook.SOLID
+                    || now - this.firstDrawNano
+                    < MagnesiumOptionPages.OPTIONS.getCaptureDelaySeconds() * 1_000_000_000L) {
+                return;
+            }
         }
-        if (MagnesiumPassHook.kind() != MagnesiumPassHook.SOLID
-                || now - this.firstDrawNano < MagnesiumOptionPages.OPTIONS.getCaptureDelaySeconds() * 1_000_000_000L) {
+        if (!MagnesiumTextureSync.sync(frame)) {
             return;
         }
-        if (!MagnesiumTextureSync.sync()) {
-            return;
-        }
+        MetalBridge.setChunkFrameMode(frame);
+        MetalBridge.setFrameZeroCopy(frame && MagnesiumGlComposite.zeroCopyAllowed());
         MetalBridge.setChunkCulling(MagnesiumOptionPages.OPTIONS.isCullBackFaces());
         if (MetalBridge.beginChunkCapture(width, height, mvp)) {
             this.captureOpen = true;
+            this.captureIsFrame = frame;
+            this.captureWidth = width;
+            this.captureHeight = height;
             this.captureStartNano = now;
             MagnesiumPassHook.pushPassState();
         }
@@ -236,7 +265,7 @@ public final class MagnesiumRenderDevice implements RenderDevice {
         if (kind == MagnesiumPassHook.SOLID
                 || System.nanoTime() - this.captureStartNano > CAPTURE_TIMEOUT_NANOS) {
             // The frame wrapped (or never produced a translucent pass).
-            this.finishMetalCapture();
+            this.finishCurrentCapture();
             return;
         }
         MagnesiumPassHook.pushPassState();
@@ -245,7 +274,36 @@ public final class MagnesiumRenderDevice implements RenderDevice {
     /** Called when Sodium finishes drawing a terrain pass. */
     void onPassEnd(int kind) {
         if (this.captureOpen && kind == MagnesiumPassHook.TRANSLUCENT) {
+            this.finishCurrentCapture();
+        }
+    }
+
+    private void finishCurrentCapture() {
+        if (this.captureIsFrame) {
+            this.finishMetalFrame();
+        } else {
             this.finishMetalCapture();
+        }
+    }
+
+    /**
+     * Finishes a live frame: waits for Metal, then composites the color and
+     * depth readbacks into the bound OpenGL framebuffer.
+     */
+    private void finishMetalFrame() {
+        this.captureOpen = false;
+        int result = MetalBridge.endChunkFrame();
+        if (result == 2) {
+            if (!MagnesiumGlComposite.compositeZeroCopy()) {
+                // CGL could not bind the surfaces; use the readback path from now on.
+                MagnesiumGlComposite.disableZeroCopy();
+            }
+        } else if (result == 1) {
+            MagnesiumGlComposite.composite(
+                    this.captureWidth,
+                    this.captureHeight,
+                    MetalBridge.frameBufferAddress(0),
+                    MetalBridge.frameBufferAddress(1));
         }
     }
 
@@ -272,21 +330,29 @@ public final class MagnesiumRenderDevice implements RenderDevice {
     }
 
     /**
-     * Records that a Metal buffer has been created/allocated, returning the
-     * running total of Metal buffer bytes managed by Magnesium.
+     * Records the current size of a live Metal buffer. Called on creation and
+     * whenever the buffer is reallocated, so the totals reflect live buffers
+     * only.
      */
-    long recordMetalBuffer(long size) {
-        this.metalBufferCount.incrementAndGet();
-        this.metalBufferBytes.addAndGet(Math.max(0L, size));
-        return this.metalBufferBytes.get();
+    synchronized void recordMetalBuffer(long handle, long size) {
+        Long old = this.metalBufferSizes.put(handle, Math.max(0L, size));
+        this.metalBufferBytes += Math.max(0L, size) - (old == null ? 0L : old);
     }
 
-    public long getMetalBufferCount() {
-        return this.metalBufferCount.get();
+    /** Forgets a Metal buffer that was deleted. */
+    synchronized void releaseMetalBuffer(long handle) {
+        Long old = this.metalBufferSizes.remove(handle);
+        if (old != null) {
+            this.metalBufferBytes -= old;
+        }
     }
 
-    public long getMetalBufferBytes() {
-        return this.metalBufferBytes.get();
+    public synchronized long getMetalBufferCount() {
+        return this.metalBufferSizes.size();
+    }
+
+    public synchronized long getMetalBufferBytes() {
+        return this.metalBufferBytes;
     }
 
     /** Records that a batch of sub-draws was routed through Magnesium. */

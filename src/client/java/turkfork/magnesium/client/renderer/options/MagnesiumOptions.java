@@ -12,10 +12,13 @@ public final class MagnesiumOptions {
     private boolean testFrame;
     private boolean metalDraw;
     private int captureDelaySeconds;
-    private boolean cullBackFaces;
+    private boolean backfaceCulling;
     private boolean fpsLogging;
     private int fpsLogPeriodSeconds;
     private boolean debugOverlay;
+    private boolean metalRender;
+    private boolean menuBar;
+    private boolean disableOpenGl;
 
     public MagnesiumOptions() {
         this.metalEnabled =
@@ -24,10 +27,13 @@ public final class MagnesiumOptions {
                 "true".equalsIgnoreCase(System.getProperty("magnesium.testFrame"));
         this.metalDraw = Boolean.getBoolean("magnesium.metal.draw");
         this.captureDelaySeconds = (int) (Long.getLong("magnesium.metal.draw.warmupMs", 3000L) / 1000L);
-        this.cullBackFaces = false;
+        this.backfaceCulling = true;
         this.fpsLogging = Boolean.getBoolean("magnesium.fps.log");
         this.fpsLogPeriodSeconds = Integer.getInteger("magnesium.fps.log.period", 10);
         this.debugOverlay = true;
+        this.metalRender = false;
+        this.menuBar = true;
+        this.disableOpenGl = false;
         this.clamp();
     }
 
@@ -43,10 +49,13 @@ public final class MagnesiumOptions {
         this.testFrame = other.testFrame;
         this.metalDraw = other.metalDraw;
         this.captureDelaySeconds = other.captureDelaySeconds;
-        this.cullBackFaces = other.cullBackFaces;
+        this.backfaceCulling = other.backfaceCulling;
         this.fpsLogging = other.fpsLogging;
         this.fpsLogPeriodSeconds = other.fpsLogPeriodSeconds;
         this.debugOverlay = other.debugOverlay;
+        this.metalRender = other.metalRender;
+        this.menuBar = other.menuBar;
+        this.disableOpenGl = other.disableOpenGl;
         this.clamp();
     }
 
@@ -84,11 +93,11 @@ public final class MagnesiumOptions {
     }
 
     public boolean isCullBackFaces() {
-        return this.cullBackFaces;
+        return this.backfaceCulling;
     }
 
     public void setCullBackFaces(boolean cullBackFaces) {
-        this.cullBackFaces = cullBackFaces;
+        this.backfaceCulling = cullBackFaces;
     }
 
     public boolean isFpsLogging() {
@@ -114,5 +123,29 @@ public final class MagnesiumOptions {
 
     public void setDebugOverlay(boolean debugOverlay) {
         this.debugOverlay = debugOverlay;
+    }
+
+    public boolean isMetalRender() {
+        return this.metalRender;
+    }
+
+    public void setMetalRender(boolean metalRender) {
+        this.metalRender = metalRender;
+    }
+
+    public boolean isDisableOpenGl() {
+        return this.disableOpenGl;
+    }
+
+    public void setDisableOpenGl(boolean disableOpenGl) {
+        this.disableOpenGl = disableOpenGl;
+    }
+
+    public boolean isMenuBar() {
+        return this.menuBar;
+    }
+
+    public void setMenuBar(boolean menuBar) {
+        this.menuBar = menuBar;
     }
 }

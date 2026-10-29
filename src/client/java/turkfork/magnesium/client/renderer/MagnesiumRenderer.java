@@ -8,6 +8,7 @@ public final class MagnesiumRenderer {
     private static boolean discoveryLogged = false;
     private static boolean layerLogged = false;
     private static boolean testFrameEnabled = false;
+    private static int titleTicks = 0;
 
     private MagnesiumRenderer() {
     }
@@ -65,11 +66,19 @@ public final class MagnesiumRenderer {
             // capabilities). That is not ready until the first tick, so defer
             // installation here.
             MagnesiumDeviceInstaller.installNow();
+            // GLFW creates the macOS menu bar with the window, which does not
+            // exist yet during mod init.
+            MagnesiumMenuBar.install();
             MagnesiumFpsLogger.onTick();
+            MagnesiumMenuBar.onTick();
 
             if (!MetalBridge.isWindowDiscovered()) {
                 MetalBridge.discoverWindow();
                 return;
+            }
+
+            if (++titleTicks % 20 == 0) {
+                MetalBridge.refreshWindowTitle();
             }
 
             if (!discoveryLogged) {

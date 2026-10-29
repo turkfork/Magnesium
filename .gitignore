@@ -38,3 +38,32 @@ hs_err_*.log
 replay_*.log
 *.hprof
 *.jfr
+
+# magnesium
+# Metal capture output written to the working directory
+/magnesium-metal.png
+/magnesium-*.png
+# native build intermediates (the built libmagnesium.dylib files are tracked on purpose)
+*.o
+*.dSYM/
+*.dylib.bak
+
+# crash and logs
+crash-reports/
+logs/
+*.log
+hs_err_pid*
+
+# tooling
+.claude/
+.kotlin/
+.vscode/
+.fleet/
+*.swp
+*~
+
+# macos
+.AppleDouble
+.Spotlight-V100
+.Trashes
+._*

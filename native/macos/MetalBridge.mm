@@ -4,6 +4,12 @@
 #import <QuartzCore/QuartzCore.h>
 #import <simd/simd.h>
 #import <jni.h>
+#define GL_SILENCE_DEPRECATION 1
+#include <OpenGL/OpenGL.h>
+#include <OpenGL/CGLIOSurface.h>
+#include <OpenGL/gl.h>
+#include <IOSurface/IOSurface.h>
+#include <atomic>
 
 static id<MTLDevice> magnesiumDevice = nil;
 static id<MTLCommandQueue> magnesiumCommandQueue = nil;
@@ -31,7 +37,9 @@ static void MagnesiumAppendWindowSuffix(void) {
     }
 
     magnesiumWindow.title = [title stringByAppendingString:suffix];
-    NSLog(@"[Magnesium] Window title updated: '%@'", magnesiumWindow.title);
+    if (getenv("MAGNESIUM_VERBOSE") != NULL) {
+        NSLog(@"[Magnesium] Window title updated: '%@'", magnesiumWindow.title);
+    }
 }
 
 /*
@@ -283,6 +291,44 @@ static int magnesiumCapPass = MagnesiumPassSolid;
 static BOOL magnesiumCullBackFaces = NO;
 
 /*
+ * Frame mode: the capture is a live per-frame render. The color target is
+ * cleared to transparent, depth is kept, and both are blitted into shared
+ * buffers that Java uploads to OpenGL for compositing.
+ */
+static BOOL magnesiumFrameMode = NO;
+static uint64_t magnesiumSkippedDraws = 0;
+static id<MTLBuffer> magnesiumFrameColorBuf = nil;
+static id<MTLBuffer> magnesiumFrameDepthBuf = nil;
+
+/*
+ * Zero-copy frames: color and a packed 24-bit depth (second color attachment)
+ * render into IOSurface-backed textures that OpenGL binds as rectangle
+ * textures, so no readback or re-upload is needed.
+ */
+#define MAGNESIUM_GL_TEXTURE_RECTANGLE 0x84F5
+static BOOL magnesiumZeroCopyRequested = NO;
+static BOOL magnesiumZeroCopyActive = NO;
+static IOSurfaceRef magnesiumSurfaceColor = NULL;
+static IOSurfaceRef magnesiumSurfaceDepth = NULL;
+static id<MTLTexture> magnesiumCapAux = nil;
+
+static IOSurfaceRef MagnesiumCreateSurface(NSUInteger w, NSUInteger h) {
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth: @(w),
+        (id)kIOSurfaceHeight: @(h),
+        (id)kIOSurfaceBytesPerElement: @4,
+        (id)kIOSurfaceBytesPerRow: @(((w * 4 + 63) / 64) * 64),
+        (id)kIOSurfacePixelFormat: @(0x42475241) /* 'BGRA' */
+    };
+    return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+}
+
+static void MagnesiumReleaseSurfaces(void) {
+    if (magnesiumSurfaceColor != NULL) { CFRelease(magnesiumSurfaceColor); magnesiumSurfaceColor = NULL; }
+    if (magnesiumSurfaceDepth != NULL) { CFRelease(magnesiumSurfaceDepth); magnesiumSurfaceDepth = NULL; }
+}
+
+/*
  * Mirrors the ChunkShaderInterface uniforms that are not region-dependent:
  * u_TexCoordShrink and the smooth-fog uniforms (u_FogColor / u_FogStart /
  * u_FogEnd / u_FogShape). Layout must match ChunkUniforms in the MSL below.
@@ -314,6 +360,9 @@ static NSString *kMagnesiumChunkMSL =
      "using namespace metal;\n"
      "\n"
      "constant bool kUseFragmentDiscard [[function_constant(0)]];\n"
+     "// Solid and cutout are not blended in vanilla, so their alpha must not leave\n"
+     "// the pass (the GL composite treats color as premultiplied).\n"
+     "constant bool kForceOpaque [[function_constant(1)]];\n"
      "\n"
      "struct ChunkUniforms {\n"
      "    float4x4 mvp;\n"
@@ -326,7 +375,7 @@ static NSString *kMagnesiumChunkMSL =
      "};\n"
      "\n"
      "struct ChunkVertOut {\n"
-     "    float4 position [[position]];\n"
+     "    float4 position [[position, invariant]];\n"
      "    float4 color;\n"
      "    float2 texCoord;\n"
      "    float mipBias;\n"
@@ -407,7 +456,13 @@ static NSString *kMagnesiumChunkMSL =
      "    return out;\n"
      "}\n"
      "\n"
-     "fragment float4 chunkFragment(\n"
+     "struct ChunkFragOut {\n"
+     "    float4 color [[color(0)]];\n"
+     "    // 24-bit depth packed into RGB for the zero-copy composite.\n"
+     "    float4 depth [[color(1)]];\n"
+     "};\n"
+     "\n"
+     "fragment ChunkFragOut chunkFragment(\n"
      "        ChunkVertOut in [[stage_in]],\n"
      "        constant ChunkUniforms& unif [[buffer(1)]],\n"
      "        texture2d<float> blockTex [[texture(0)]]) {\n"
@@ -419,6 +474,10 @@ static NSString *kMagnesiumChunkMSL =
      "        }\n"
      "    }\n"
      "\n"
+     "    if (is_function_constant_defined(kForceOpaque) && kForceOpaque) {\n"
+     "        diffuse.a = 1.0f;\n"
+     "    }\n"
+     "\n"
      "    diffuse.rgb *= in.color.rgb;\n"
      "    diffuse.rgb *= in.color.a;\n"
      "\n"
@@ -428,7 +487,13 @@ static NSString *kMagnesiumChunkMSL =
      "            ? smoothstep(unif.fogStart, unif.fogEnd, in.fragDistance) : 1.0f;\n"
      "        diffuse.rgb = mix(diffuse.rgb, unif.fogColor.rgb, factor * unif.fogColor.a);\n"
      "    }\n"
-     "    return diffuse;\n"
+     "    ChunkFragOut out;\n"
+     "    out.color = diffuse;\n"
+     "    uint d24 = uint(clamp(in.position.z, 0.0f, 1.0f) * 16777215.0f + 0.5f);\n"
+     "    out.depth = float4(float((d24 >> 16u) & 0xFFu),\n"
+     "                       float((d24 >> 8u) & 0xFFu),\n"
+     "                       float(d24 & 0xFFu), 255.0f) / 255.0f;\n"
+     "    return out;\n"
      "}\n";
 
 static BOOL MagnesiumEnsureChunkPipeline(void) {
@@ -437,9 +502,14 @@ static BOOL MagnesiumEnsureChunkPipeline(void) {
     }
 
     NSError *error = nil;
+    /* Coplanar overlay quads (grass sides, dripstone) need bit-identical
+     * positions across draws, so no fast-math reassociation. */
+    MTLCompileOptions *compileOptions = [[MTLCompileOptions alloc] init];
+    compileOptions.fastMathEnabled = NO;
+    compileOptions.preserveInvariance = YES;
     id<MTLLibrary> library =
         [magnesiumDevice newLibraryWithSource:kMagnesiumChunkMSL
-                                      options:nil
+                                      options:compileOptions
                                         error:&error];
     if (library == nil) {
         NSLog(@"[Magnesium] chunk pipeline: MSL compile failed: %@",
@@ -456,6 +526,10 @@ static BOOL MagnesiumEnsureChunkPipeline(void) {
         [constants setConstantValue:&discard
                                type:MTLDataTypeBool
                             atIndex:0];
+        BOOL forceOpaque = !translucent;
+        [constants setConstantValue:&forceOpaque
+                               type:MTLDataTypeBool
+                            atIndex:1];
 
         id<MTLFunction> vertexFn =
             [library newFunctionWithName:@"chunkVertex"
@@ -475,7 +549,12 @@ static BOOL MagnesiumEnsureChunkPipeline(void) {
             [[MTLRenderPipelineDescriptor alloc] init];
         desc.vertexFunction = vertexFn;
         desc.fragmentFunction = fragmentFn;
-        desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        desc.colorAttachments[1].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        desc.colorAttachments[1].blendingEnabled = NO;
+        /* Translucent geometry does not write depth. */
+        desc.colorAttachments[1].writeMask =
+            translucent ? MTLColorWriteMaskNone : MTLColorWriteMaskAll;
         desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
         if (translucent) {
@@ -547,6 +626,187 @@ static inline simd_float3 MagnesiumDecodeCompactPosition(uint hi, uint lo) {
     uint y = (((hi >> 10u) & 0x3FFu) << 10u) | ((lo >> 10u) & 0x3FFu);
     uint z = (((hi >> 20u) & 0x3FFu) << 10u) | ((lo >> 20u) & 0x3FFu);
     return simd_make_float3((float)x, (float)y, (float)z) * (32.0f / 1048576.0f) - 8.0f;
+}
+
+
+/*
+ * macOS menu bar integration.
+ *
+ * GLFW builds a default menu bar titled after the process ("java"). This
+ * renames it to the requested app name and adds a "Magnesium" menu. Menu
+ * actions never call into Java directly: they set bits in an atomic mask that
+ * the Java client tick drains with pollMenuActions(), and check marks are
+ * driven by states Java pushes through setMenuState().
+ */
+enum {
+    MagnesiumMenuToggleMetalRender = 0,
+    MagnesiumMenuToggleDisableGl = 1,
+    MagnesiumMenuCaptureFrame = 2,
+    MagnesiumMenuToggleOverlay = 3,
+    MagnesiumMenuToggleFpsLog = 4,
+    MagnesiumMenuActionCount = 5
+};
+
+static std::atomic<int32_t> magnesiumMenuPending(0);
+static BOOL magnesiumMenuStates[MagnesiumMenuActionCount] = { NO, NO, NO, NO, NO };
+static NSString *magnesiumMenuGameDir = nil;
+static NSString *magnesiumMenuConfigDir = nil;
+static NSString *magnesiumMenuVersion = nil;
+static BOOL magnesiumMenuInstalled = NO;
+
+@interface MagnesiumMenuTarget : NSObject
+- (void)fire:(NSMenuItem *)item;
+- (void)showGameFolder:(id)sender;
+- (void)showConfigFolder:(id)sender;
+- (void)showAbout:(id)sender;
+@end
+
+@implementation MagnesiumMenuTarget
+
+- (void)fire:(NSMenuItem *)item {
+    if (item.tag >= 0 && item.tag < MagnesiumMenuActionCount) {
+        magnesiumMenuPending.fetch_or(1 << item.tag);
+    }
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if (item.tag >= 0 && item.tag < MagnesiumMenuActionCount &&
+        item.tag != MagnesiumMenuCaptureFrame) {
+        item.state = magnesiumMenuStates[item.tag] ? NSControlStateValueOn
+                                                   : NSControlStateValueOff;
+    }
+    return YES;
+}
+
+- (void)showGameFolder:(id)sender {
+    if (magnesiumMenuGameDir != nil) {
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:magnesiumMenuGameDir]];
+    }
+}
+
+- (void)showConfigFolder:(id)sender {
+    if (magnesiumMenuConfigDir != nil) {
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:magnesiumMenuConfigDir]];
+    }
+}
+
+- (void)showAbout:(id)sender {
+    NSDictionary *options = @{
+        @"ApplicationName": @"Magnesium",
+        @"ApplicationVersion": magnesiumMenuVersion ?: @"dev",
+        @"Version": @"",
+        @"Credits": [[NSAttributedString alloc]
+            initWithString:@"An experimental Metal rendering backend for Sodium on macOS."]
+    };
+    [NSApp orderFrontStandardAboutPanelWithOptions:options];
+}
+
+@end
+
+static MagnesiumMenuTarget *magnesiumMenuTarget = nil;
+
+static NSMenuItem *MagnesiumAddItem(NSMenu *menu, NSString *title, SEL action, NSInteger tag) {
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:@""];
+    item.target = magnesiumMenuTarget;
+    item.tag = tag;
+    [menu addItem:item];
+    return item;
+}
+
+/*
+ * Runs on the AppKit main thread. Returns NO if GLFW has not created the main
+ * menu yet, so the caller can retry.
+ */
+static BOOL MagnesiumInstallMenuBar(NSString *appName) {
+    @autoreleasepool {
+        if (magnesiumMenuInstalled) {
+            return YES;
+        }
+        NSMenu *mainMenu = NSApp.mainMenu;
+        if (mainMenu == nil || mainMenu.numberOfItems == 0) {
+            return NO;
+        }
+
+        NSString *oldName = [[NSProcessInfo processInfo] processName];
+
+        /* The bold title in the menu bar comes from the bundle name. */
+        [[NSProcessInfo processInfo] setProcessName:appName];
+        NSMutableDictionary *info =
+            (NSMutableDictionary *)[[NSBundle mainBundle] infoDictionary];
+        if ([info isKindOfClass:[NSMutableDictionary class]]) {
+            info[@"CFBundleName"] = appName;
+            info[@"CFBundleDisplayName"] = appName;
+        }
+
+        /* Rename the app menu and its "About java" / "Hide java" / "Quit java" items. */
+        NSMenuItem *appItem = [mainMenu itemAtIndex:0];
+        appItem.title = appName;
+        NSMenu *appMenu = appItem.submenu;
+        if (appMenu != nil) {
+            appMenu.title = appName;
+            if (oldName.length > 0 && ![oldName isEqualToString:appName]) {
+                for (NSMenuItem *item in appMenu.itemArray) {
+                    if ([item.title rangeOfString:oldName].location != NSNotFound) {
+                        item.title = [item.title stringByReplacingOccurrencesOfString:oldName
+                                                                           withString:appName];
+                    }
+                }
+            }
+        }
+
+        magnesiumMenuTarget = [[MagnesiumMenuTarget alloc] init];
+
+        NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Magnesium"];
+        menu.autoenablesItems = YES;
+        MagnesiumAddItem(menu, @"Metal Terrain Rendering (Experimental)",
+                         @selector(fire:), MagnesiumMenuToggleMetalRender);
+        MagnesiumAddItem(menu, @"Disable OpenGL Terrain Draw (Experimental)",
+                         @selector(fire:), MagnesiumMenuToggleDisableGl);
+        [menu addItem:[NSMenuItem separatorItem]];
+        MagnesiumAddItem(menu, @"Capture Metal Frame to PNG",
+                         @selector(fire:), MagnesiumMenuCaptureFrame);
+        [menu addItem:[NSMenuItem separatorItem]];
+        MagnesiumAddItem(menu, @"F3 Overlay Info",
+                         @selector(fire:), MagnesiumMenuToggleOverlay);
+        MagnesiumAddItem(menu, @"Framerate Logging",
+                         @selector(fire:), MagnesiumMenuToggleFpsLog);
+        [menu addItem:[NSMenuItem separatorItem]];
+        MagnesiumAddItem(menu, @"Show Game Folder", @selector(showGameFolder:), 100);
+        MagnesiumAddItem(menu, @"Show Config Folder", @selector(showConfigFolder:), 101);
+        [menu addItem:[NSMenuItem separatorItem]];
+        MagnesiumAddItem(menu, @"About Magnesium", @selector(showAbout:), 102);
+
+        NSMenuItem *root = [[NSMenuItem alloc] initWithTitle:@"Magnesium"
+                                                      action:nil
+                                               keyEquivalent:@""];
+        root.submenu = menu;
+
+        /* Keep GLFW's trailing Window menu last. */
+        NSInteger index = mainMenu.numberOfItems;
+        if (index > 1) {
+            index -= 1;
+        }
+        [mainMenu insertItem:root atIndex:index];
+
+        magnesiumMenuInstalled = YES;
+        NSLog(@"[Magnesium] Menu bar installed (app name '%@', was '%@').", appName, oldName);
+        return YES;
+    }
+}
+
+/* Retries every 0.5s for up to 30s while GLFW is still starting up. */
+static void MagnesiumInstallMenuBarWithRetry(NSString *appName, int attemptsLeft) {
+    if (MagnesiumInstallMenuBar(appName)) {
+        return;
+    }
+    if (attemptsLeft <= 0) {
+        NSLog(@"[Magnesium] Menu bar: gave up, no main menu appeared.");
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        MagnesiumInstallMenuBarWithRetry(appName, attemptsLeft - 1);
+    });
 }
 
 extern "C" {
@@ -659,6 +919,45 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_uploadTextureLevel(
     }
 }
 
+/* Uploads RGBA8 pixels into a sub-rectangle of one mip level. */
+JNIEXPORT void JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_uploadTextureRegion(
+    JNIEnv *env,
+    jclass clazz,
+    jint slot,
+    jint level,
+    jint x,
+    jint y,
+    jint width,
+    jint height,
+    jobject src
+) {
+    @autoreleasepool {
+        id<MTLTexture> texture = (slot == 0) ? magnesiumBlockTexture
+                               : (slot == 1) ? magnesiumLightTexture : nil;
+        if (texture == nil || src == NULL || level < 0 || x < 0 || y < 0 ||
+            width <= 0 || height <= 0 ||
+            (NSUInteger)level >= texture.mipmapLevelCount) {
+            return;
+        }
+        NSUInteger mipW = MAX((NSUInteger)1, texture.width >> level);
+        NSUInteger mipH = MAX((NSUInteger)1, texture.height >> level);
+        if ((NSUInteger)(x + width) > mipW || (NSUInteger)(y + height) > mipH) {
+            return;
+        }
+        void *base = env->GetDirectBufferAddress(src);
+        jlong cap = (jlong)env->GetDirectBufferCapacity(src);
+        if (base == NULL || cap < (jlong)width * height * 4) {
+            return;
+        }
+        [texture replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y,
+                                               (NSUInteger)width, (NSUInteger)height)
+                   mipmapLevel:(NSUInteger)level
+                     withBytes:base
+                   bytesPerRow:(NSUInteger)width * 4];
+    }
+}
+
 /*
  * Selects the terrain pass (0 solid, 1 cutout, 2 translucent) and supplies
  * the pass-wide uniforms: params = [fogR, fogG, fogB, fogA, fogStart, fogEnd,
@@ -730,18 +1029,52 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_beginChunkCapture(
             }
         }
 
+        BOOL wantZeroCopy = magnesiumFrameMode && magnesiumZeroCopyRequested;
         if ((NSUInteger)width != magnesiumCapWidth ||
             (NSUInteger)height != magnesiumCapHeight ||
-            magnesiumCapColor == nil) {
+            magnesiumCapColor == nil ||
+            wantZeroCopy != magnesiumZeroCopyActive) {
+            MagnesiumReleaseSurfaces();
+            magnesiumCapColor = nil;
+            magnesiumCapAux = nil;
+
             MTLTextureDescriptor *colorDesc =
                 [[MTLTextureDescriptor alloc] init];
-            colorDesc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+            colorDesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
             colorDesc.width = (NSUInteger)width;
             colorDesc.height = (NSUInteger)height;
             colorDesc.usage =
                 MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            magnesiumCapColor =
-                [magnesiumDevice newTextureWithDescriptor:colorDesc];
+
+            if (wantZeroCopy) {
+                magnesiumSurfaceColor = MagnesiumCreateSurface(width, height);
+                magnesiumSurfaceDepth = MagnesiumCreateSurface(width, height);
+                if (magnesiumSurfaceColor != NULL && magnesiumSurfaceDepth != NULL) {
+                    magnesiumCapColor =
+                        [magnesiumDevice newTextureWithDescriptor:colorDesc
+                                                        iosurface:magnesiumSurfaceColor
+                                                            plane:0];
+                    magnesiumCapAux =
+                        [magnesiumDevice newTextureWithDescriptor:colorDesc
+                                                        iosurface:magnesiumSurfaceDepth
+                                                            plane:0];
+                }
+                if (magnesiumCapColor == nil || magnesiumCapAux == nil) {
+                    NSLog(@"[Magnesium] IOSurface targets failed; using readback.");
+                    MagnesiumReleaseSurfaces();
+                    magnesiumCapColor = nil;
+                    magnesiumCapAux = nil;
+                    wantZeroCopy = NO;
+                    magnesiumZeroCopyRequested = NO;
+                }
+            }
+            if (magnesiumCapColor == nil) {
+                magnesiumCapColor =
+                    [magnesiumDevice newTextureWithDescriptor:colorDesc];
+                magnesiumCapAux =
+                    [magnesiumDevice newTextureWithDescriptor:colorDesc];
+            }
+            magnesiumZeroCopyActive = wantZeroCopy;
 
             MTLTextureDescriptor *depthDesc =
                 [[MTLTextureDescriptor alloc] init];
@@ -754,9 +1087,27 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_beginChunkCapture(
 
             magnesiumCapWidth = (NSUInteger)width;
             magnesiumCapHeight = (NSUInteger)height;
+            magnesiumFrameColorBuf = nil;
+            magnesiumFrameDepthBuf = nil;
         }
 
-        if (magnesiumCapColor == nil || magnesiumCapDepth == nil) {
+        if (magnesiumFrameMode && !magnesiumZeroCopyActive &&
+            magnesiumFrameColorBuf == nil) {
+            NSUInteger bytes = magnesiumCapWidth * magnesiumCapHeight * 4;
+            magnesiumFrameColorBuf =
+                [magnesiumDevice newBufferWithLength:bytes
+                                             options:MTLResourceStorageModeShared];
+            magnesiumFrameDepthBuf =
+                [magnesiumDevice newBufferWithLength:bytes
+                                             options:MTLResourceStorageModeShared];
+            if (magnesiumFrameColorBuf == nil || magnesiumFrameDepthBuf == nil) {
+                NSLog(@"[Magnesium] frame readback buffers failed (%lu bytes).",
+                      (unsigned long)bytes);
+                return JNI_FALSE;
+            }
+        }
+
+        if (magnesiumCapColor == nil || magnesiumCapAux == nil || magnesiumCapDepth == nil) {
             return JNI_FALSE;
         }
 
@@ -769,11 +1120,17 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_beginChunkCapture(
         pass.colorAttachments[0].texture = magnesiumCapColor;
         pass.colorAttachments[0].loadAction = MTLLoadActionClear;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor =
-            MTLClearColorMake(0.30, 0.55, 0.70, 1.0);
+        pass.colorAttachments[0].clearColor = magnesiumFrameMode
+            ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
+            : MTLClearColorMake(0.30, 0.55, 0.70, 1.0);
+        pass.colorAttachments[1].texture = magnesiumCapAux;
+        pass.colorAttachments[1].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[1].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[1].clearColor = MTLClearColorMake(1.0, 1.0, 1.0, 1.0);
         pass.depthAttachment.texture = magnesiumCapDepth;
         pass.depthAttachment.loadAction = MTLLoadActionClear;
-        pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+        pass.depthAttachment.storeAction =
+            magnesiumFrameMode ? MTLStoreActionStore : MTLStoreActionDontCare;
         pass.depthAttachment.clearDepth = 1.0;
 
         magnesiumCapCommandBuffer =
@@ -892,7 +1249,7 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_drawChunkBatch(
         const int32_t *counts = (const int32_t *)(intptr_t)pElementCount;
         const int32_t *bases = (const int32_t *)(intptr_t)pBaseVertex;
 
-        if (magnesiumCapSubDraws == 0L) {
+        if (magnesiumCapSubDraws == 0L && !magnesiumFrameMode) {
             NSLog(@"[Magnesium] capMvp={%.3f,%.3f,%.3f,%.3f, %.3f,%.3f,%.3f,%.3f, %.3f,%.3f,%.3f,%.3f, %.3f,%.3f,%.3f,%.3f}",
                   magnesiumCapMvp[0], magnesiumCapMvp[1], magnesiumCapMvp[2], magnesiumCapMvp[3],
                   magnesiumCapMvp[4], magnesiumCapMvp[5], magnesiumCapMvp[6], magnesiumCapMvp[7],
@@ -992,6 +1349,19 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_drawChunkBatch(
             if (count <= 0) {
                 continue;
             }
+            /* Never encode a draw that reads outside the mirrors: Sodium's batches are
+             * quad lists, so the highest vertex touched is base + (count / 6) * 4. */
+            uint64_t indexBytes = (uint64_t)count * (indexType == MTLIndexTypeUInt16 ? 2u : 4u);
+            uint64_t vertexEnd = ((uint64_t)(base < 0 ? 0 : base) + (uint64_t)(count / 6) * 4u) * 20u;
+            if (base < 0 || indexBytes > indexBuffer.length || vertexEnd > vertexBuffer.length) {
+                if (magnesiumSkippedDraws++ < 5) {
+                    NSLog(@"[Magnesium] skipped out-of-range draw: count=%d base=%d "
+                          "(index mirror %lu bytes, vertex mirror %lu bytes)",
+                          count, base, (unsigned long)indexBuffer.length,
+                          (unsigned long)vertexBuffer.length);
+                }
+                continue;
+            }
             [magnesiumCapEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                             indexCount:count
                                              indexType:indexType
@@ -1004,6 +1374,123 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_drawChunkBatch(
         }
         magnesiumCapSubDraws += elementCount;
     }
+}
+
+JNIEXPORT void JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_setChunkFrameMode(
+    JNIEnv *env,
+    jclass clazz,
+    jboolean frameMode
+) {
+    magnesiumFrameMode = (frameMode == JNI_TRUE) ? YES : NO;
+}
+
+/*
+ * Ends a frame-mode capture: commits the pass, blits color and depth into the
+ * shared readback buffers, and waits for the GPU. Returns false if nothing
+ * usable was produced.
+ */
+JNIEXPORT jint JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_endChunkFrame(
+    JNIEnv *env,
+    jclass clazz
+) {
+    @autoreleasepool {
+        if (!magnesiumCaptureOpen ||
+            magnesiumCapEncoder == nil ||
+            magnesiumCapCommandBuffer == nil ||
+            (!magnesiumZeroCopyActive &&
+             (magnesiumFrameColorBuf == nil || magnesiumFrameDepthBuf == nil))) {
+            MagnesiumResetCaptureState();
+            return 0;
+        }
+
+        [magnesiumCapEncoder endEncoding];
+
+        NSUInteger w = magnesiumCapWidth;
+        NSUInteger h = magnesiumCapHeight;
+        if (!magnesiumZeroCopyActive) {
+        id<MTLBlitCommandEncoder> blit = [magnesiumCapCommandBuffer blitCommandEncoder];
+        [blit copyFromTexture:magnesiumCapColor
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(w, h, 1)
+                     toBuffer:magnesiumFrameColorBuf
+            destinationOffset:0
+       destinationBytesPerRow:w * 4
+     destinationBytesPerImage:w * h * 4];
+        [blit copyFromTexture:magnesiumCapDepth
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(w, h, 1)
+                     toBuffer:magnesiumFrameDepthBuf
+            destinationOffset:0
+       destinationBytesPerRow:w * 4
+     destinationBytesPerImage:w * h * 4
+                      options:MTLBlitOptionDepthFromDepthStencil];
+        [blit endEncoding];
+        }
+
+        [magnesiumCapCommandBuffer commit];
+        [magnesiumCapCommandBuffer waitUntilCompleted];
+
+        BOOL ok = (magnesiumCapCommandBuffer.status == MTLCommandBufferStatusCompleted);
+        if (!ok) {
+            NSLog(@"[Magnesium] frame command buffer failed: %@",
+                  magnesiumCapCommandBuffer.error.localizedDescription);
+        }
+        MagnesiumResetCaptureState();
+        return !ok ? 0 : (magnesiumZeroCopyActive ? 2 : 1);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_setFrameZeroCopy(
+    JNIEnv *env,
+    jclass clazz,
+    jboolean zeroCopy
+) {
+    magnesiumZeroCopyRequested = (zeroCopy == JNI_TRUE) ? YES : NO;
+}
+
+/*
+ * Binds an IOSurface (0 = color, 1 = packed depth) to the GL rectangle texture
+ * currently bound on the calling thread's CGL context. Must be re-run after
+ * every frame the surface is rewritten.
+ */
+JNIEXPORT jboolean JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_bindFrameSurface(
+    JNIEnv *env,
+    jclass clazz,
+    jint which
+) {
+    IOSurfaceRef surface = (which == 0) ? magnesiumSurfaceColor : magnesiumSurfaceDepth;
+    CGLContextObj ctx = CGLGetCurrentContext();
+    if (surface == NULL || ctx == NULL || !magnesiumZeroCopyActive) {
+        return JNI_FALSE;
+    }
+    CGLError err = CGLTexImageIOSurface2D(
+        ctx, MAGNESIUM_GL_TEXTURE_RECTANGLE, GL_RGBA,
+        (GLsizei)IOSurfaceGetWidth(surface), (GLsizei)IOSurfaceGetHeight(surface),
+        GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, surface, 0);
+    if (err != kCGLNoError) {
+        NSLog(@"[Magnesium] CGLTexImageIOSurface2D failed: %s", CGLErrorString(err));
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+/* Address of the shared readback buffer: 0 = color (RGBA8), 1 = depth (R32F). */
+JNIEXPORT jlong JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_frameBufferAddress(
+    JNIEnv *env,
+    jclass clazz,
+    jint which
+) {
+    id<MTLBuffer> buffer = (which == 0) ? magnesiumFrameColorBuf : magnesiumFrameDepthBuf;
+    return (buffer == nil) ? 0 : (jlong)(intptr_t)[buffer contents];
 }
 
 JNIEXPORT jlongArray JNICALL
@@ -1040,6 +1527,13 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_endChunkCapture(
                             bytesPerRow:bpr
                              fromRegion:MTLRegionMake2D(0, 0, w, h)
                             mipmapLevel:0];
+        }
+
+        if (pixels != NULL) {
+            uint8_t *q = (uint8_t *)pixels;
+            for (NSUInteger i = 0; i < w * h; i++, q += 4) {
+                uint8_t t = q[0]; q[0] = q[2]; q[2] = t; /* BGRA -> RGBA */
+            }
         }
 
         int64_t drawn = 0;
@@ -1116,6 +1610,60 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_endChunkCapture(
 
         MagnesiumResetCaptureState();
         return result;
+    }
+}
+
+
+JNIEXPORT void JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_installMenuBar(
+    JNIEnv *env,
+    jclass clazz,
+    jstring appName,
+    jstring version,
+    jstring gameDir,
+    jstring configDir
+) {
+    auto toNS = [&](jstring str) -> NSString * {
+        if (str == NULL) {
+            return nil;
+        }
+        const char *chars = env->GetStringUTFChars(str, NULL);
+        if (chars == NULL) {
+            return nil;
+        }
+        NSString *result = [NSString stringWithUTF8String:chars];
+        env->ReleaseStringUTFChars(str, chars);
+        return result;
+    };
+
+    NSString *name = toNS(appName) ?: @"Minecraft";
+    magnesiumMenuVersion = toNS(version);
+    magnesiumMenuGameDir = toNS(gameDir);
+    magnesiumMenuConfigDir = toNS(configDir);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        MagnesiumInstallMenuBarWithRetry(name, 60);
+    });
+}
+
+/* Drains and returns the bitmask of menu actions chosen since the last call. */
+JNIEXPORT jint JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_pollMenuActions(
+    JNIEnv *env,
+    jclass clazz
+) {
+    return (jint)magnesiumMenuPending.exchange(0);
+}
+
+JNIEXPORT void JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_setMenuState(
+    JNIEnv *env,
+    jclass clazz,
+    jint action,
+    jboolean on
+) {
+    if (action >= 0 && action < MagnesiumMenuActionCount) {
+        magnesiumMenuStates[action] = (on == JNI_TRUE) ? YES : NO;
     }
 }
 
@@ -1211,6 +1759,24 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_discoverWindow(
 
     dispatch_async(dispatch_get_main_queue(), ^{
         MagnesiumRunWindowDiscovery();
+    });
+}
+
+/*
+ * Re-applies the " - Magnesium" title suffix on the main thread. Minecraft
+ * resets the window title (e.g. when entering a world), which drops it.
+ * Idempotent, so it is safe to call repeatedly.
+ */
+JNIEXPORT void JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_refreshWindowTitle(
+    JNIEnv *env,
+    jclass clazz
+) {
+    if (magnesiumWindow == nil) {
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        MagnesiumAppendWindowSuffix();
     });
 }
 
@@ -1327,8 +1893,10 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_createBuffer(
         if (handle == 0) {
             return 0;
         }
-        NSLog(@"[Magnesium] createBuffer: size=%lld handle=%lld",
-              (long long)size, (long long)handle);
+        if (getenv("MAGNESIUM_VERBOSE") != NULL) {
+            NSLog(@"[Magnesium] createBuffer: size=%lld handle=%lld",
+                  (long long)size, (long long)handle);
+        }
         return (jlong)handle;
     }
 }
@@ -1521,6 +2089,9 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_shutdown(
         }
         magnesiumBlockTexture = nil;
         magnesiumLightTexture = nil;
+        magnesiumFrameColorBuf = nil;
+        magnesiumFrameDepthBuf = nil;
+        MagnesiumReleaseSurfaces();
         magnesiumLayer = nil;
         magnesiumWindow = nil;
         magnesiumCommandQueue = nil;

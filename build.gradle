@@ -69,6 +69,13 @@ jar {
 tasks.named("runClient") {
 	jvmArgs "-Dmagnesium.native.path=${file("native/macos/libmagnesium.dylib").absolutePath}"
 
+	/*
+	 * Names the macOS menu bar app menu / Dock entry "Minecraft" instead of
+	 * "java". This is the reliable way to do it; Magnesium's menu bar
+	 * integration also renames the menu at runtime.
+	 */
+	jvmArgs "-Xdock:name=Minecraft"
+
 	def metalEnabled = providers.gradleProperty("magnesium.metal.enabled").orNull
 	if (metalEnabled != null) {
 		jvmArgs "-Dmagnesium.metal.enabled=${metalEnabled}"

@@ -73,7 +73,7 @@ public final class MagnesiumCommandList implements CommandList {
         GlImmutableBuffer buffer = delegate().createImmutableBuffer(size, flags);
         long handle = MetalBridge.createBuffer(size);
         this.bufferToMetal.put(buffer, handle);
-        this.device.recordMetalBuffer(size);
+        this.device.recordMetalBuffer(handle, size);
         return buffer;
     }
 
@@ -104,7 +104,7 @@ public final class MagnesiumCommandList implements CommandList {
             handle = MetalBridge.createBuffer(length);
             if (handle != 0L) {
                 this.bufferToMetal.put(buffer, handle);
-                this.device.recordMetalBuffer(length);
+                this.device.recordMetalBuffer(handle, length);
             }
         } else if (MetalBridge.bufferLength(handle) < length) {
             // glBufferData reallocates; a Metal buffer cannot grow in place.
@@ -112,7 +112,7 @@ public final class MagnesiumCommandList implements CommandList {
             // chunk upload, so without this later (larger) uploads are truncated
             // to the size of the first one and the arena receives zeros.
             MetalBridge.allocateBufferStorage(handle, length);
-            this.device.recordMetalBuffer(length);
+            this.device.recordMetalBuffer(handle, length);
         }
         if (handle != 0L) {
             // The slice starts at the buffer's position and has capacity ==
@@ -152,18 +152,21 @@ public final class MagnesiumCommandList implements CommandList {
             handle = MetalBridge.createBuffer(size);
             if (handle != 0L) {
                 this.bufferToMetal.put(buffer, handle);
-                this.device.recordMetalBuffer(size);
+                this.device.recordMetalBuffer(handle, size);
             }
         } else {
             MetalBridge.allocateBufferStorage(handle, size);
+            this.device.recordMetalBuffer(handle, MetalBridge.bufferLength(handle));
         }
     }
 
     @Override
     public void deleteBuffer(GlBuffer buffer) {
-        long handle = this.bufferToMetal.remove(buffer);
+        Long removed = this.bufferToMetal.remove(buffer);
+        long handle = removed == null ? 0L : removed;
         if (handle != 0L) {
             MetalBridge.deleteBuffer(handle);
+            this.device.releaseMetalBuffer(handle);
         }
         delegate().deleteBuffer(buffer);
     }
@@ -205,7 +208,7 @@ public final class MagnesiumCommandList implements CommandList {
             handle = MetalBridge.createBuffer(length);
             if (handle != 0L) {
                 this.bufferToMetal.put(buffer, handle);
-                this.device.recordMetalBuffer(length);
+                this.device.recordMetalBuffer(handle, length);
             }
         }
         if (handle != 0L && mapping != null) {

@@ -7,7 +7,10 @@
 		"DefaultChunkRendererMixin",
 		"ExampleClientMixin",
 		"MagnesiumDebugHudMixin",
-		"SodiumOptionsGUIMixin"
+		"SodiumOptionsGUIMixin",
+		"SpriteTickerMixin",
+		"NativeImageMixin",
+		"LightTextureMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

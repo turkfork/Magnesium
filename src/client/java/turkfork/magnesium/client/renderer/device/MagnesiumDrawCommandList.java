@@ -57,10 +57,12 @@ public final class MagnesiumDrawCommandList implements DrawCommandList {
                             + batch.size() + " sub-draws, indexType="
                             + indexType.getFormatId());
         }
-        if (this.device.isMetalDrawEnabled()) {
+        if (this.device.isMetalRenderEnabled() || this.device.isMetalDrawEnabled()) {
             metalCaptureRasterize(batch, indexType);
         }
-        this.delegate.multiDrawElementsBaseVertex(batch, indexType);
+        if (!this.device.isOpenGlDrawDisabled()) {
+            this.delegate.multiDrawElementsBaseVertex(batch, indexType);
+        }
     }
 
     /**
@@ -72,7 +74,7 @@ public final class MagnesiumDrawCommandList implements DrawCommandList {
      * mirrors.
      */
     private void metalCaptureRasterize(MultiDrawBatch batch, GlIndexType indexType) {
-        if (this.device.isMetalCaptureDone()) {
+        if (this.device.isMetalCaptureDone() && !this.device.isMetalRenderEnabled()) {
             return;
         }
         float[] origin = MagnesiumRegionHook.origin();
