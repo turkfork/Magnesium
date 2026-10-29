@@ -5,6 +5,8 @@ import me.jellysquid.mods.sodium.client.gui.options.OptionGroup;
 import me.jellysquid.mods.sodium.client.gui.options.OptionImpl;
 import me.jellysquid.mods.sodium.client.gui.options.OptionImpact;
 import me.jellysquid.mods.sodium.client.gui.options.OptionPage;
+import me.jellysquid.mods.sodium.client.gui.options.control.ControlValueFormatter;
+import me.jellysquid.mods.sodium.client.gui.options.control.SliderControl;
 import me.jellysquid.mods.sodium.client.gui.options.control.TickBoxControl;
 import net.minecraft.network.chat.Component;
 
@@ -55,6 +57,71 @@ public final class MagnesiumOptionPages {
                                 .setControl(TickBoxControl::new)
                                 .setBinding(MagnesiumOptions::setTestFrame,
                                         MagnesiumOptions::isTestFrame)
+                                .build())
+                        .build(),
+                OptionGroup.createBuilder()
+                        .add(OptionImpl.createBuilder(Boolean.class, STORAGE)
+                                .setName(Component.literal("Offscreen Metal draw"))
+                                .setTooltip(Component.literal(
+                                        "Render one full terrain frame (solid, cutout, "
+                                                + "translucent) through Metal into an offscreen "
+                                                + "target and save it as magnesium-metal.png. "
+                                                + "Turning this on again captures another frame. "
+                                                + "Requires the Metal translation."))
+                                .setControl(TickBoxControl::new)
+                                .setBinding(MagnesiumOptions::setMetalDraw,
+                                        MagnesiumOptions::isMetalDraw)
+                                .setImpact(OptionImpact.MEDIUM)
+                                .build())
+                        .add(OptionImpl.createBuilder(int.class, STORAGE)
+                                .setName(Component.literal("Capture delay"))
+                                .setTooltip(Component.literal(
+                                        "Seconds to wait after the first terrain draw before "
+                                                + "capturing, so nearby chunks can mesh and upload."))
+                                .setControl(option -> new SliderControl(option, 0,
+                                        MagnesiumOptions.MAX_CAPTURE_DELAY_SECONDS, 1,
+                                        ControlValueFormatter.quantityOrDisabled("s", "None")))
+                                .setBinding(MagnesiumOptions::setCaptureDelaySeconds,
+                                        MagnesiumOptions::getCaptureDelaySeconds)
+                                .build())
+                        .add(OptionImpl.createBuilder(Boolean.class, STORAGE)
+                                .setName(Component.literal("Back-face culling (experimental)"))
+                                .setTooltip(Component.literal(
+                                        "Cull back faces in the Metal terrain pass. The winding "
+                                                + "order has not been verified against Sodium's "
+                                                + "quads yet, so faces may disappear."))
+                                .setControl(TickBoxControl::new)
+                                .setBinding(MagnesiumOptions::setCullBackFaces,
+                                        MagnesiumOptions::isCullBackFaces)
+                                .build())
+                        .build(),
+                OptionGroup.createBuilder()
+                        .add(OptionImpl.createBuilder(Boolean.class, STORAGE)
+                                .setName(Component.literal("F3 overlay info"))
+                                .setTooltip(Component.literal(
+                                        "Show the Magnesium section in the F3 debug overlay."))
+                                .setControl(TickBoxControl::new)
+                                .setBinding(MagnesiumOptions::setDebugOverlay,
+                                        MagnesiumOptions::isDebugOverlay)
+                                .build())
+                        .add(OptionImpl.createBuilder(Boolean.class, STORAGE)
+                                .setName(Component.literal("Framerate logging"))
+                                .setTooltip(Component.literal(
+                                        "Periodically print the FPS and Metal buffer/draw "
+                                                + "statistics to the console."))
+                                .setControl(TickBoxControl::new)
+                                .setBinding(MagnesiumOptions::setFpsLogging,
+                                        MagnesiumOptions::isFpsLogging)
+                                .build())
+                        .add(OptionImpl.createBuilder(int.class, STORAGE)
+                                .setName(Component.literal("Logging interval"))
+                                .setTooltip(Component.literal(
+                                        "Seconds between framerate log lines."))
+                                .setControl(option -> new SliderControl(option, 1,
+                                        MagnesiumOptions.MAX_FPS_LOG_PERIOD_SECONDS, 1,
+                                        ControlValueFormatter.quantityOrDisabled("s", "Off")))
+                                .setBinding(MagnesiumOptions::setFpsLogPeriodSeconds,
+                                        MagnesiumOptions::getFpsLogPeriodSeconds)
                                 .build())
                         .build()
         );

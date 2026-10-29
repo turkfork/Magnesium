@@ -2,12 +2,14 @@ package turkfork.magnesium.client.renderer;
 
 import net.minecraft.client.Minecraft;
 import turkfork.magnesium.client.renderer.device.MagnesiumRenderDevice;
+import static turkfork.magnesium.client.renderer.options.MagnesiumOptionPages.OPTIONS;
 
 /**
  * Periodically logs the current frame rate to the console.
  *
- * <p>Enabled with {@code -Dmagnesium.fps.log=true}. The logging interval can be
- * tuned with {@code -Dmagnesium.fps.log.period=N} seconds (default 10). When the
+ * <p>Toggled and tuned from the Magnesium page in Sodium's settings; the initial
+ * values come from {@code -Dmagnesium.fps.log=true} and
+ * {@code -Dmagnesium.fps.log.period=N} seconds (default 10). When the
  * Metal translation device is installed, the message additionally reports the
  * number of Metal buffers, Metal buffer storage bytes and translated draw calls
  * routed through Magnesium so frame-rate behaviour can be correlated with the
@@ -15,26 +17,6 @@ import turkfork.magnesium.client.renderer.device.MagnesiumRenderDevice;
  */
 public final class MagnesiumFpsLogger {
 
-    private static final boolean ENABLED = Boolean.getBoolean("magnesium.fps.log");
-
-    private static final int PERIOD_SECONDS;
-    private static final int PERIOD_TICKS;
-
-    static {
-        int period = 10;
-        String raw = System.getProperty("magnesium.fps.log.period");
-        if (raw != null) {
-            try {
-                period = Math.max(1, Integer.parseInt(raw.trim()));
-            } catch (NumberFormatException ignored) {
-                // keep the default period
-            }
-        }
-        PERIOD_SECONDS = period;
-        PERIOD_TICKS = PERIOD_SECONDS * 20;
-    }
-
-    private static boolean started = false;
     private static int tickCounter = 0;
 
     private MagnesiumFpsLogger() {
@@ -45,13 +27,11 @@ public final class MagnesiumFpsLogger {
      * notice when the logger is enabled so the property is visible in logs.
      */
     public static void initialize() {
-        if (!ENABLED) {
-            return;
+        if (OPTIONS.isFpsLogging()) {
+            System.out.println(
+                    "[Magnesium] Framerate logging enabled "
+                            + "(every " + OPTIONS.getFpsLogPeriodSeconds() + "s).");
         }
-        started = true;
-        System.out.println(
-                "[Magnesium] Framerate logging enabled "
-                        + "(every " + PERIOD_SECONDS + "s).");
     }
 
     /**
@@ -59,15 +39,18 @@ public final class MagnesiumFpsLogger {
      * once every configured period.
      */
     public static void onTick() {
-        if (!started) {
+        // Read live so the Sodium settings page takes effect immediately.
+        if (!OPTIONS.isFpsLogging()) {
+            tickCounter = 0;
             return;
         }
 
         tickCounter++;
 
-        if (tickCounter % PERIOD_TICKS != 0) {
+        if (tickCounter < OPTIONS.getFpsLogPeriodSeconds() * 20) {
             return;
         }
+        tickCounter = 0;
 
         int fps = Minecraft.getInstance().getFps();
 

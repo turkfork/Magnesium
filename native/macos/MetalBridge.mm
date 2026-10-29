@@ -257,8 +257,18 @@ int64_t MagnesiumCreateBuffer(NSUInteger length) {
  * Metal pipeline: the compact ChunkVertexComms decode, the region vertex/
  * index mirrors, and drawIndexedPrimitives.
  */
-static id<MTLRenderPipelineState> magnesiumChunkPipeline = nil;
-static id<MTLDepthStencilState> magnesiumDepthState = nil;
+/* Pass kinds, matching MagnesiumPassHook on the Java side. */
+enum {
+    MagnesiumPassSolid = 0,
+    MagnesiumPassCutout = 1,
+    MagnesiumPassTranslucent = 2,
+    MagnesiumPassCount = 3
+};
+
+static id<MTLRenderPipelineState> magnesiumChunkPipelines[MagnesiumPassCount] = { nil, nil, nil };
+static id<MTLDepthStencilState> magnesiumDepthStates[MagnesiumPassCount] = { nil, nil, nil };
+static id<MTLTexture> magnesiumBlockTexture = nil;
+static id<MTLTexture> magnesiumLightTexture = nil;
 static id<MTLTexture> magnesiumCapColor = nil;
 static id<MTLTexture> magnesiumCapDepth = nil;
 static NSUInteger magnesiumCapWidth = 0;
@@ -269,28 +279,70 @@ static BOOL magnesiumCaptureOpen = NO;
 static uint64_t magnesiumCapIndices = 0;
 static int64_t magnesiumCapSubDraws = 0;
 static float magnesiumCapMvp[16];
+static int magnesiumCapPass = MagnesiumPassSolid;
+static BOOL magnesiumCullBackFaces = NO;
 
+/*
+ * Mirrors the ChunkShaderInterface uniforms that are not region-dependent:
+ * u_TexCoordShrink and the smooth-fog uniforms (u_FogColor / u_FogStart /
+ * u_FogEnd / u_FogShape). Layout must match ChunkUniforms in the MSL below.
+ */
 typedef struct {
     matrix_float4x4 mvp;
     vector_float3 regionOffset;
+    vector_float2 texCoordShrink;
+    vector_float4 fogColor;
+    float fogStart;
+    float fogEnd;
+    int32_t fogShape;
 } MagnesiumChunkUniforms;
 
+static vector_float2 magnesiumTexCoordShrink = { 0.0f, 0.0f };
+static vector_float4 magnesiumFogColor = { 0.0f, 0.0f, 0.0f, 0.0f };
+static float magnesiumFogStart = 1.0e9f;
+static float magnesiumFogEnd = 1.0e9f;
+static int32_t magnesiumFogShape = 0;
+
+/*
+ * MSL port of Sodium 0.5.11's block_layer_opaque.vsh / .fsh with
+ * CompactChunkVertex (stride 20): a_Position (2 x uint32), a_Color (4 x ubyte
+ * normalized), a_TexCoord (2 x ushort), a_LightAndData (4 x ubyte: light.xy,
+ * material, draw id). USE_FRAGMENT_DISCARD is the function constant at 0.
+ */
 static NSString *kMagnesiumChunkMSL =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
      "\n"
+     "constant bool kUseFragmentDiscard [[function_constant(0)]];\n"
+     "\n"
      "struct ChunkUniforms {\n"
      "    float4x4 mvp;\n"
      "    float3 regionOffset;\n"
+     "    float2 texCoordShrink;\n"
+     "    float4 fogColor;\n"
+     "    float fogStart;\n"
+     "    float fogEnd;\n"
+     "    int fogShape;\n"
      "};\n"
      "\n"
      "struct ChunkVertOut {\n"
      "    float4 position [[position]];\n"
      "    float4 color;\n"
+     "    float2 texCoord;\n"
+     "    float mipBias;\n"
+     "    float alphaCutoff;\n"
+     "    float fragDistance;\n"
      "};\n"
      "\n"
-     "// Reconstruct the 20-bit signed-position triplet packed across two uints\n"
-     "// (CompactChunkVertex: hi contains bits 10..19, lo bits 0..9, per axis).\n"
+     "constexpr sampler lightSampler(coord::normalized, address::clamp_to_edge,\n"
+     "                               filter::linear);\n"
+     "constexpr sampler blockSampler(coord::normalized, address::clamp_to_edge,\n"
+     "                               mag_filter::nearest, min_filter::nearest,\n"
+     "                               mip_filter::linear);\n"
+     "\n"
+     "constant float kAlphaCutoff[4] = { 0.0f, 0.1f, 0.5f, 1.0f };\n"
+     "\n"
+     "// _deinterleave_u20x3: hi holds bits 10..19, lo bits 0..9, per axis.\n"
      "inline float3 decodePosition(uint hi, uint lo) {\n"
      "    uint x = (((hi >> 0u) & 0x3FFu) << 10u) | ((lo >> 0u) & 0x3FFu);\n"
      "    uint y = (((hi >> 10u) & 0x3FFu) << 10u) | ((lo >> 10u) & 0x3FFu);\n"
@@ -298,14 +350,23 @@ static NSString *kMagnesiumChunkMSL =
      "    return float3(x, y, z) * (32.0f / 1048576.0f) - 8.0f;\n"
      "}\n"
      "\n"
+     "inline float fragDistanceFor(int shape, float3 p) {\n"
+     "    if (shape == 1) {\n"
+     "        return max(length(p.xz), abs(p.y));\n"
+     "    }\n"
+     "    return length(p);\n"
+     "}\n"
+     "\n"
      "vertex ChunkVertOut chunkVertex(\n"
      "        const device uint32_t* verts [[buffer(0)]],\n"
      "        constant ChunkUniforms& unif [[buffer(1)]],\n"
+     "        texture2d<float> lightTex [[texture(1)]],\n"
      "        uint vid [[vertex_id]]) {\n"
      "    uint off = vid * 5u;\n"
-     "    uint hi          = verts[off + 0u];\n"
-     "    uint lo          = verts[off + 1u];\n"
-     "    uint colorBits   = verts[off + 2u];\n"
+     "    uint hi           = verts[off + 0u];\n"
+     "    uint lo           = verts[off + 1u];\n"
+     "    uint colorBits    = verts[off + 2u];\n"
+     "    uint texBits      = verts[off + 3u];\n"
      "    uint lightAndData = verts[off + 4u];\n"
      "\n"
      "    float3 local = decodePosition(hi, lo);\n"
@@ -318,26 +379,60 @@ static NSString *kMagnesiumChunkMSL =
      "    float3 position = local + float3(cx, cy, cz) * 16.0f + unif.regionOffset;\n"
      "\n"
      "    ChunkVertOut out;\n"
-     "    float4 color = float4(colorBits & 0xFFu,\n"
-     "                          (colorBits >> 8u) & 0xFFu,\n"
-     "                          (colorBits >> 16u) & 0xFFu,\n"
-     "                          (colorBits >> 24u) & 0xFFu) / 255.0f;\n"
-     "    out.color = color;\n"
+     "    out.fragDistance = fragDistanceFor(unif.fogShape, position);\n"
      "\n"
      "    float4 clip = unif.mvp * float4(position, 1.0f);\n"
      "    // Remap GL [-1,1] clip-space depth to Metal's [0,1] before the\n"
      "    // rasterizer divides by w and maps to the depth range.\n"
      "    clip.z = clip.z * 0.5f + 0.5f * clip.w;\n"
      "    out.position = clip;\n"
+     "\n"
+     "    float4 vertColor = float4(colorBits & 0xFFu,\n"
+     "                              (colorBits >> 8u) & 0xFFu,\n"
+     "                              (colorBits >> 16u) & 0xFFu,\n"
+     "                              (colorBits >> 24u) & 0xFFu) / 255.0f;\n"
+     "    float2 lightCoord = float2(lightAndData & 0xFFu,\n"
+     "                               (lightAndData >> 8u) & 0xFFu) / 256.0f;\n"
+     "    out.color = vertColor * lightTex.sample(lightSampler, lightCoord, level(0));\n"
+     "\n"
+     "    // 15-bit texcoord with the sign bit of the shrink bias in bit 15.\n"
+     "    float2 texCoord = float2(texBits & 0x7FFFu, (texBits >> 16u) & 0x7FFFu) / 32768.0f;\n"
+     "    float2 texBias = float2(((texBits >> 15u) & 1u) != 0u ? 1.0f : -1.0f,\n"
+     "                            ((texBits >> 31u) & 1u) != 0u ? 1.0f : -1.0f);\n"
+     "    out.texCoord = texBias * unif.texCoordShrink + texCoord;\n"
+     "\n"
+     "    uint material = (lightAndData >> 16u) & 0xFFu;\n"
+     "    out.mipBias = ((material & 1u) != 0u) ? 0.0f : -4.0f;\n"
+     "    out.alphaCutoff = kAlphaCutoff[(material >> 1u) & 3u];\n"
      "    return out;\n"
      "}\n"
      "\n"
-     "fragment float4 chunkFragment(ChunkVertOut in [[stage_in]]) {\n"
-     "    return float4(in.color.rgb, 1.0f);\n"
+     "fragment float4 chunkFragment(\n"
+     "        ChunkVertOut in [[stage_in]],\n"
+     "        constant ChunkUniforms& unif [[buffer(1)]],\n"
+     "        texture2d<float> blockTex [[texture(0)]]) {\n"
+     "    float4 diffuse = blockTex.sample(blockSampler, in.texCoord, bias(in.mipBias));\n"
+     "\n"
+     "    if (is_function_constant_defined(kUseFragmentDiscard) && kUseFragmentDiscard) {\n"
+     "        if (diffuse.a < in.alphaCutoff) {\n"
+     "            discard_fragment();\n"
+     "        }\n"
+     "    }\n"
+     "\n"
+     "    diffuse.rgb *= in.color.rgb;\n"
+     "    diffuse.rgb *= in.color.a;\n"
+     "\n"
+     "    // _linearFog\n"
+     "    if (in.fragDistance > unif.fogStart) {\n"
+     "        float factor = in.fragDistance < unif.fogEnd\n"
+     "            ? smoothstep(unif.fogStart, unif.fogEnd, in.fragDistance) : 1.0f;\n"
+     "        diffuse.rgb = mix(diffuse.rgb, unif.fogColor.rgb, factor * unif.fogColor.a);\n"
+     "    }\n"
+     "    return diffuse;\n"
      "}\n";
 
 static BOOL MagnesiumEnsureChunkPipeline(void) {
-    if (magnesiumChunkPipeline != nil) {
+    if (magnesiumChunkPipelines[MagnesiumPassTranslucent] != nil) {
         return YES;
     }
 
@@ -352,37 +447,83 @@ static BOOL MagnesiumEnsureChunkPipeline(void) {
         return NO;
     }
 
-    id<MTLFunction> vertexFn = [library newFunctionWithName:@"chunkVertex"];
-    id<MTLFunction> fragmentFn = [library newFunctionWithName:@"chunkFragment"];
-    if (vertexFn == nil || fragmentFn == nil) {
-        NSLog(@"[Magnesium] chunk pipeline: missing entry points.");
-        return NO;
+    for (int pass = 0; pass < MagnesiumPassCount; pass++) {
+        BOOL discard = (pass == MagnesiumPassCutout);
+        BOOL translucent = (pass == MagnesiumPassTranslucent);
+
+        MTLFunctionConstantValues *constants =
+            [[MTLFunctionConstantValues alloc] init];
+        [constants setConstantValue:&discard
+                               type:MTLDataTypeBool
+                            atIndex:0];
+
+        id<MTLFunction> vertexFn =
+            [library newFunctionWithName:@"chunkVertex"
+                          constantValues:constants
+                                   error:&error];
+        id<MTLFunction> fragmentFn =
+            [library newFunctionWithName:@"chunkFragment"
+                          constantValues:constants
+                                   error:&error];
+        if (vertexFn == nil || fragmentFn == nil) {
+            NSLog(@"[Magnesium] chunk pipeline: missing entry points: %@",
+                  error.localizedDescription);
+            return NO;
+        }
+
+        MTLRenderPipelineDescriptor *desc =
+            [[MTLRenderPipelineDescriptor alloc] init];
+        desc.vertexFunction = vertexFn;
+        desc.fragmentFunction = fragmentFn;
+        desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+
+        if (translucent) {
+            /* Vanilla translucent layer:
+             * glBlendFuncSeparate(SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ONE, ONE_MINUS_SRC_ALPHA) */
+            MTLRenderPipelineColorAttachmentDescriptor *att = desc.colorAttachments[0];
+            att.blendingEnabled = YES;
+            att.rgbBlendOperation = MTLBlendOperationAdd;
+            att.alphaBlendOperation = MTLBlendOperationAdd;
+            att.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+            att.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            att.sourceAlphaBlendFactor = MTLBlendFactorOne;
+            att.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        } else {
+            desc.colorAttachments[0].blendingEnabled = NO;
+        }
+
+        magnesiumChunkPipelines[pass] =
+            [magnesiumDevice newRenderPipelineStateWithDescriptor:desc
+                                                            error:&error];
+        if (magnesiumChunkPipelines[pass] == nil) {
+            NSLog(@"[Magnesium] chunk pipeline %d: state creation failed: %@",
+                  pass, error.localizedDescription);
+            return NO;
+        }
+
+        /* Vanilla uses GL_LEQUAL; translucent geometry tests but does not write depth. */
+        MTLDepthStencilDescriptor *ds = [[MTLDepthStencilDescriptor alloc] init];
+        ds.depthCompareFunction = MTLCompareFunctionLessEqual;
+        ds.depthWriteEnabled = translucent ? NO : YES;
+        magnesiumDepthStates[pass] =
+            [magnesiumDevice newDepthStencilStateWithDescriptor:ds];
     }
 
-    MTLRenderPipelineDescriptor *desc =
-        [[MTLRenderPipelineDescriptor alloc] init];
-    desc.vertexFunction = vertexFn;
-    desc.fragmentFunction = fragmentFn;
-    desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-    desc.colorAttachments[0].blendingEnabled = NO;
-    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-
-    magnesiumChunkPipeline =
-        [magnesiumDevice newRenderPipelineStateWithDescriptor:desc
-                                                        error:&error];
-    if (magnesiumChunkPipeline == nil) {
-        NSLog(@"[Magnesium] chunk pipeline: state creation failed: %@",
-              error.localizedDescription);
-        return NO;
-    }
-
-    MTLDepthStencilDescriptor *ds = [[MTLDepthStencilDescriptor alloc] init];
-    ds.depthCompareFunction = MTLCompareFunctionLess;
-    ds.depthWriteEnabled = YES;
-    magnesiumDepthState = [magnesiumDevice newDepthStencilStateWithDescriptor:ds];
-
-    NSLog(@"[Magnesium] chunk pipeline ready.");
+    NSLog(@"[Magnesium] chunk pipelines ready (solid/cutout/translucent).");
     return YES;
+}
+
+/* Binds the pipeline, depth state and textures for the current pass. */
+static void MagnesiumApplyPassState(void) {
+    if (magnesiumCapEncoder == nil) {
+        return;
+    }
+    int pass = magnesiumCapPass;
+    [magnesiumCapEncoder setRenderPipelineState:magnesiumChunkPipelines[pass]];
+    [magnesiumCapEncoder setDepthStencilState:magnesiumDepthStates[pass]];
+    [magnesiumCapEncoder setFragmentTexture:magnesiumBlockTexture atIndex:0];
+    [magnesiumCapEncoder setVertexTexture:magnesiumLightTexture atIndex:1];
 }
 
 static void MagnesiumSetCapMatrices(const jfloat *mvp) {
@@ -448,6 +589,119 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_writeBufferRange(
     }
 }
 
+/*
+ * Creates (or replaces) a sampled RGBA8 texture. Slot 0 is the block atlas
+ * (u_BlockTex), slot 1 is the light map (u_LightTex).
+ */
+JNIEXPORT jboolean JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_createTexture(
+    JNIEnv *env,
+    jclass clazz,
+    jint slot,
+    jint width,
+    jint height,
+    jint mipLevels
+) {
+    @autoreleasepool {
+        if (magnesiumDevice == nil || width <= 0 || height <= 0 ||
+            mipLevels <= 0 || (slot != 0 && slot != 1)) {
+            return JNI_FALSE;
+        }
+        MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        desc.width = (NSUInteger)width;
+        desc.height = (NSUInteger)height;
+        desc.mipmapLevelCount = (NSUInteger)mipLevels;
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModeShared;
+        id<MTLTexture> texture = [magnesiumDevice newTextureWithDescriptor:desc];
+        if (texture == nil) {
+            NSLog(@"[Magnesium] createTexture: failed slot=%d %dx%d mips=%d.",
+                  slot, width, height, mipLevels);
+            return JNI_FALSE;
+        }
+        if (slot == 0) {
+            magnesiumBlockTexture = texture;
+        } else {
+            magnesiumLightTexture = texture;
+        }
+        return JNI_TRUE;
+    }
+}
+
+/* Uploads tightly packed RGBA8 pixels for one mip level of a texture slot. */
+JNIEXPORT void JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_uploadTextureLevel(
+    JNIEnv *env,
+    jclass clazz,
+    jint slot,
+    jint level,
+    jint width,
+    jint height,
+    jobject src
+) {
+    @autoreleasepool {
+        id<MTLTexture> texture = (slot == 0) ? magnesiumBlockTexture
+                               : (slot == 1) ? magnesiumLightTexture : nil;
+        if (texture == nil || src == NULL || level < 0 ||
+            (NSUInteger)level >= texture.mipmapLevelCount) {
+            return;
+        }
+        void *base = env->GetDirectBufferAddress(src);
+        jlong cap = (jlong)env->GetDirectBufferCapacity(src);
+        if (base == NULL || cap < (jlong)width * height * 4) {
+            return;
+        }
+        [texture replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)width, (NSUInteger)height)
+                   mipmapLevel:(NSUInteger)level
+                     withBytes:base
+                   bytesPerRow:(NSUInteger)width * 4];
+    }
+}
+
+/*
+ * Selects the terrain pass (0 solid, 1 cutout, 2 translucent) and supplies
+ * the pass-wide uniforms: params = [fogR, fogG, fogB, fogA, fogStart, fogEnd,
+ * fogShape, texCoordShrinkX, texCoordShrinkY].
+ */
+JNIEXPORT void JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_setChunkPassState(
+    JNIEnv *env,
+    jclass clazz,
+    jint passKind,
+    jfloatArray params
+) {
+    @autoreleasepool {
+        if (passKind < 0 || passKind >= MagnesiumPassCount ||
+            params == NULL || env->GetArrayLength(params) != 9) {
+            return;
+        }
+        jfloat p[9];
+        env->GetFloatArrayRegion(params, 0, 9, p);
+        magnesiumFogColor = simd_make_float4(p[0], p[1], p[2], p[3]);
+        magnesiumFogStart = p[4];
+        magnesiumFogEnd = p[5];
+        magnesiumFogShape = (int32_t)p[6];
+        magnesiumTexCoordShrink = simd_make_float2(p[7], p[8]);
+
+        if (magnesiumCapPass != passKind) {
+            magnesiumCapPass = passKind;
+            if (magnesiumCaptureOpen) {
+                MagnesiumApplyPassState();
+            }
+        }
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_setChunkCulling(
+    JNIEnv *env,
+    jclass clazz,
+    jboolean cullBackFaces
+) {
+    magnesiumCullBackFaces = (cullBackFaces == JNI_TRUE) ? YES : NO;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_turkfork_magnesium_client_renderer_MetalBridge_beginChunkCapture(
     JNIEnv *env,
@@ -459,7 +713,9 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_beginChunkCapture(
     @autoreleasepool {
         if (!MagnesiumEnsureChunkPipeline() ||
             magnesiumDevice == nil ||
-            magnesiumCommandQueue == nil) {
+            magnesiumCommandQueue == nil ||
+            magnesiumBlockTexture == nil ||
+            magnesiumLightTexture == nil) {
             return JNI_FALSE;
         }
 
@@ -524,10 +780,10 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_beginChunkCapture(
             [magnesiumCommandQueue commandBuffer];
         magnesiumCapEncoder =
             [magnesiumCapCommandBuffer renderCommandEncoderWithDescriptor:pass];
-        [magnesiumCapEncoder setRenderPipelineState:magnesiumChunkPipeline];
-        [magnesiumCapEncoder setDepthStencilState:magnesiumDepthState];
+        magnesiumCapPass = MagnesiumPassSolid;
+        MagnesiumApplyPassState();
         [magnesiumCapEncoder setFrontFacingWinding:MTLWindingCounterClockwise];
-        [magnesiumCapEncoder setCullMode:MTLCullModeNone];
+        [magnesiumCapEncoder setCullMode:magnesiumCullBackFaces ? MTLCullModeBack : MTLCullModeNone];
 
         magnesiumCaptureOpen = YES;
         magnesiumCapIndices = 0;
@@ -618,9 +874,17 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_drawChunkBatch(
         MagnesiumChunkUniforms uniforms;
         uniforms.mvp = m;
         uniforms.regionOffset = simd_make_float3(ox, oy, oz);
+        uniforms.texCoordShrink = magnesiumTexCoordShrink;
+        uniforms.fogColor = magnesiumFogColor;
+        uniforms.fogStart = magnesiumFogStart;
+        uniforms.fogEnd = magnesiumFogEnd;
+        uniforms.fogShape = magnesiumFogShape;
         [magnesiumCapEncoder setVertexBytes:&uniforms
                                      length:sizeof(uniforms)
                                     atIndex:1];
+        [magnesiumCapEncoder setFragmentBytes:&uniforms
+                                       length:sizeof(uniforms)
+                                      atIndex:1];
         [magnesiumCapEncoder setVertexBuffer:vertexBuffer
                                       offset:0
                                      atIndex:0];
@@ -1251,6 +1515,12 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_shutdown(
             @"[Magnesium] Shutting down Metal..."
         );
 
+        for (int i = 0; i < MagnesiumPassCount; i++) {
+            magnesiumChunkPipelines[i] = nil;
+            magnesiumDepthStates[i] = nil;
+        }
+        magnesiumBlockTexture = nil;
+        magnesiumLightTexture = nil;
         magnesiumLayer = nil;
         magnesiumWindow = nil;
         magnesiumCommandQueue = nil;

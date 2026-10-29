@@ -1,6 +1,7 @@
 package turkfork.magnesium.client.renderer;
 
 import turkfork.magnesium.client.renderer.device.MagnesiumRenderDevice;
+import turkfork.magnesium.client.renderer.options.MagnesiumOptionPages;
 
 import java.util.List;
 
@@ -20,6 +21,9 @@ public final class MagnesiumDebugInfo {
 
     /** Appends the Magnesium section to the F3 overlay's left-hand list. */
     public static void appendTo(List<String> list) {
+        if (!MagnesiumOptionPages.OPTIONS.isDebugOverlay()) {
+            return;
+        }
         MagnesiumRenderDevice device = MagnesiumDeviceInstaller.getDevice();
         boolean enabled = MagnesiumDeviceInstaller.isEnabled();
 

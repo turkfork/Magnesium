@@ -69,12 +69,14 @@ Sodium funnels almost all OpenGL through three interfaces:
 
 ### Vertex format — `CompactChunkVertex` (stride 20 bytes)
 
+Verified against `block_layer_opaque.vsh` / `chunk_vertex.glsl`:
+
 | Attribute | Offset | Format |
 |---|---|---|
-| POSITION_MATERIAL_MESH | 0 | 4 × UNSIGNED_SHORT (int) |
-| COLOR_SHADE | 8 | 4 × UNSIGNED_BYTE (normalized) |
-| BLOCK_TEXTURE | 12 | 2 × UNSIGNED_SHORT |
-| LIGHT_TEXTURE | 16 | 2 × UNSIGNED_SHORT (int) |
+| a_Position | 0 | 2 × uint32 — three interleaved 20-bit coords (`hi` = bits 10..19, `lo` = bits 0..9) |
+| a_Color | 8 | 4 × UNSIGNED_BYTE (normalized): rgb tint, a = AO shade |
+| a_TexCoord | 12 | 2 × UNSIGNED_SHORT: 15-bit coord, bit 15 = shrink-bias sign |
+| a_LightAndData | 16 | 4 × UNSIGNED_BYTE: light.xy (/256), material bits, draw id (`LocalSectionIndex`) |
 
 ### Buffer layout
 
@@ -110,10 +112,17 @@ CAMetalLayer drawable and reproduce depth/blend/cull state per pass.
    playable — the Metal buffers are created/validated with real chunk data but are not
    yet the on-screen path.
 
-2. **Milestone 2:** Redirect `GlAbstractTessellation.bindAttributes()` and the
-   `multiDrawElementsBaseVertex` draw path to a `MTLRenderCommandEncoder` +
-   `MTLRenderPipelineState` (MSL translation of `block_layer_opaque`), rendering into a
-   Metal render target.
+2. **Milestone 2 (current):** Draw Sodium's terrain batches through Metal
+   (`MTLRenderCommandEncoder` + `MTLRenderPipelineState`) into an offscreen render
+   target. Done so far: a full MSL port of `block_layer_opaque` (block atlas with
+   mips, light map, texcoord shrink, mip bias, alpha cutoff, smooth fog), one
+   pipeline per pass (solid / cutout with `discard` / translucent with blending and
+   no depth write), and a frame-accurate capture (one whole solid→cutout→translucent
+   frame, dumped to PNG with `-Pmagnesium.metal.draw=true`). Pass boundaries come
+   from `DefaultChunkRendererMixin`; atlas/light map are read back from GL by
+   `MagnesiumTextureSync`. Still open: per-frame (not one-shot) rendering, face
+   culling, `GlAbstractTessellation.bindAttributes()` redirection, atlas re-sync on
+   resource reload.
 
 3. **Milestone 3:** Own the CAMetalLayer as the final frame target; reproduce depth /
    blend / cull per `RenderLayer`; mirror `glViewport` + swap.

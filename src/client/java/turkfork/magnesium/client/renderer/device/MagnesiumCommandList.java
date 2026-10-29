@@ -96,19 +96,28 @@ public final class MagnesiumCommandList implements CommandList {
             return;
         }
         int length = data.remaining();
+        if (length <= 0) {
+            return;
+        }
         long handle = this.metalOf(buffer);
         if (handle == 0L) {
-            if (length <= 0) {
-                return;
-            }
             handle = MetalBridge.createBuffer(length);
             if (handle != 0L) {
                 this.bufferToMetal.put(buffer, handle);
                 this.device.recordMetalBuffer(length);
             }
+        } else if (MetalBridge.bufferLength(handle) < length) {
+            // glBufferData reallocates; a Metal buffer cannot grow in place.
+            // Sodium's FallbackStagingBuffer reuses one mutable buffer for every
+            // chunk upload, so without this later (larger) uploads are truncated
+            // to the size of the first one and the arena receives zeros.
+            MetalBridge.allocateBufferStorage(handle, length);
+            this.device.recordMetalBuffer(length);
         }
         if (handle != 0L) {
-            MetalBridge.uploadBufferData(handle, data);
+            // The slice starts at the buffer's position and has capacity ==
+            // remaining(), which is what the native side reads.
+            MetalBridge.uploadBufferData(handle, data.slice());
         }
     }
 
@@ -166,7 +175,6 @@ public final class MagnesiumCommandList implements CommandList {
 
     @Override
     public void flush() {
-        this.device.closeMetalCaptureIfOpen();
         delegate().flush();
     }
 
@@ -182,7 +190,6 @@ public final class MagnesiumCommandList implements CommandList {
 
     @Override
     public void close() {
-        this.device.closeMetalCaptureIfOpen();
         delegate().close();
     }
 

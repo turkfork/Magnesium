@@ -24,8 +24,8 @@ import turkfork.magnesium.client.renderer.MetalBridge;
  * camera rotation; translation is supplied per-region, captured from Sodium's
  * own render-region origin via {@link MagnesiumRegionHook} so the Metal
  * rasterization matches the GL one exactly without any GL state reads.
- * The offscreen result is dumped to a PNG at the first render-pass boundary
- * (Sodium calls {@code CommandList.flush()} once per layer) with
+ * The offscreen result is dumped to a PNG once one full terrain frame (solid,
+ * cutout, translucent; see {@link MagnesiumPassHook}) has been drawn, with
  * coverage/color statistics for verification.
  *
  * <p>This wrapper is deliberately allocation-free and lock-free on the render
@@ -145,13 +145,11 @@ public final class MagnesiumDrawCommandList implements DrawCommandList {
 
     @Override
     public void flush() {
-        this.device.closeMetalCaptureIfOpen();
         this.delegate.flush();
     }
 
     @Override
     public void close() {
-        this.device.closeMetalCaptureIfOpen();
         this.delegate.close();
     }
 }

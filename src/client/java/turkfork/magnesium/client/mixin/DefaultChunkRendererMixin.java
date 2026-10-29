@@ -1,6 +1,10 @@
 package turkfork.magnesium.client.mixin;
 
+import me.jellysquid.mods.sodium.client.gl.device.CommandList;
+import me.jellysquid.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import me.jellysquid.mods.sodium.client.render.chunk.DefaultChunkRenderer;
+import me.jellysquid.mods.sodium.client.render.chunk.lists.ChunkRenderListIterable;
+import me.jellysquid.mods.sodium.client.render.chunk.terrain.TerrainRenderPass;
 import me.jellysquid.mods.sodium.client.render.chunk.region.RenderRegion;
 import me.jellysquid.mods.sodium.client.render.chunk.shader.ChunkShaderInterface;
 import me.jellysquid.mods.sodium.client.render.viewport.CameraTransform;
@@ -8,6 +12,7 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import turkfork.magnesium.client.renderer.device.MagnesiumPassHook;
 import turkfork.magnesium.client.renderer.device.MagnesiumRegionHook;
 
 /**
@@ -26,5 +31,28 @@ public class DefaultChunkRendererMixin {
             CallbackInfo ci) {
         MagnesiumRegionHook.captureOrigin(
                 region.getOriginX(), region.getOriginY(), region.getOriginZ());
+    }
+
+    /** Records which terrain pass (solid / cutout / translucent) is being drawn. */
+    @Inject(method = "render", at = @At("HEAD"))
+    private void magnesium$beginPass(
+            ChunkRenderMatrices matrices,
+            CommandList commandList,
+            ChunkRenderListIterable renderLists,
+            TerrainRenderPass pass,
+            CameraTransform camera,
+            CallbackInfo ci) {
+        MagnesiumPassHook.beginPass(pass);
+    }
+
+    @Inject(method = "render", at = @At("RETURN"))
+    private void magnesium$endPass(
+            ChunkRenderMatrices matrices,
+            CommandList commandList,
+            ChunkRenderListIterable renderLists,
+            TerrainRenderPass pass,
+            CameraTransform camera,
+            CallbackInfo ci) {
+        MagnesiumPassHook.endPass();
     }
 }

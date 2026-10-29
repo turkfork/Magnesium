@@ -217,6 +217,30 @@ public final class MetalBridge {
                                                int srcOffset, int length);
 
     /**
+     * Creates (or replaces) a sampled RGBA8 texture. Slot 0 is the block atlas
+     * ({@code u_BlockTex}), slot 1 the light map ({@code u_LightTex}).
+     */
+    public static native boolean createTexture(int slot, int width, int height, int mipLevels);
+
+    /**
+     * Uploads tightly packed RGBA8 pixels for one mip level of a texture slot.
+     */
+    public static native void uploadTextureLevel(int slot, int level, int width, int height,
+                                                 java.nio.ByteBuffer rgba);
+
+    /**
+     * Selects the terrain pass (0 solid, 1 cutout, 2 translucent) and supplies
+     * the pass-wide uniforms: {@code [fogR, fogG, fogB, fogA, fogStart, fogEnd,
+     * fogShape, texCoordShrinkX, texCoordShrinkY]}.
+     */
+    public static native void setChunkPassState(int passKind, float[] params);
+
+    /**
+     * Whether the next capture culls back faces (counter-clockwise front faces).
+     */
+    public static native void setChunkCulling(boolean cullBackFaces);
+
+    /**
      * Opens an offscreen Metal capture pass at the given size for the current
      * model-view-projection (the chunk shader's u_ProjectionMatrix multiplied
      * by u_ModelViewMatrix, in column-major order).

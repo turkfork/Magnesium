@@ -80,8 +80,7 @@ public final class MagnesiumOptionsStorage implements OptionStorage<MagnesiumOpt
             MagnesiumOptions loaded = GSON.fromJson(json, MagnesiumOptions.class);
 
             if (loaded != null) {
-                options.setMetalEnabled(loaded.isMetalEnabled());
-                options.setTestFrame(loaded.isTestFrame());
+                options.copyFrom(loaded);
                 System.out.println("[Magnesium] Loaded options from: " + source);
             }
         } catch (Exception e) {

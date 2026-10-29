@@ -11,6 +11,7 @@ import me.jellysquid.mods.sodium.client.gl.tessellation.GlTessellation;
 import me.jellysquid.mods.sodium.client.gl.tessellation.TessellationBinding;
 import org.lwjgl.opengl.GLCapabilities;
 import turkfork.magnesium.client.renderer.MetalBridge;
+import turkfork.magnesium.client.renderer.options.MagnesiumOptionPages;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -43,26 +44,24 @@ public final class MagnesiumRenderDevice implements RenderDevice {
 
     /**
      * When {@code -Dmagnesium.metal.draw=true}, real Metal draws are issued for
-     * Sodium's chunk batches against an offscreen Metal render target (opaque
-     * pass only), with the result dumped to a PNG for verification. The GL path
-     * continues to own the on-screen framebuffer.
+     * Sodium's chunk batches against an offscreen Metal render target, with the
+     * result dumped to a PNG for verification. The GL path continues to own the
+     * on-screen framebuffer.
+     *
+     * <p>Once the warm-up delay has elapsed, exactly one complete terrain frame
+     * (solid, cutout and translucent passes, in Sodium's order) is rendered
+     * with the textured Metal pipelines and written out.
      */
-    private final boolean metalDrawEnabled = Boolean.getBoolean("magnesium.metal.draw");
+    private boolean metalDrawWasEnabled = false;
     private volatile boolean captureDone = false;
     private boolean captureOpen = false;
+    private long firstDrawNano = 0L;
     private long captureStartNano = 0L;
     private long tessVertexMetal = 0L;
     private long tessIndexMetal = 0L;
 
-    /**
-     * Minimum lifetime of an open capture. Sodium flushes the command list
-     * after every render layer (several per frame), so a capture that ends on
-     * the very first flush would contain only the player's subterranean column
-     * (which legitimately projects below the view). Keeping the capture open
-     * for a short window accumulates the full terrain pass (surface included)
-     * into the offscreen render target before the PNG is dumped.
-     */
-    private static final long CAPTURE_WINDOW_NANOS = 250_000_000L;
+    /** A capture that never sees its translucent pass is abandoned after this long. */
+    private static final long CAPTURE_TIMEOUT_NANOS = 2_000_000_000L;
 
     public MagnesiumRenderDevice() {
         this.delegate = new me.jellysquid.mods.sodium.client.gl.device.GLRenderDevice();
@@ -165,8 +164,19 @@ public final class MagnesiumRenderDevice implements RenderDevice {
         return handle == null ? 0L : handle;
     }
 
+    /**
+     * Whether the offscreen Metal draw is switched on. Turning the option off
+     * and on again re-arms the capture: the "done" latch is cleared and a new
+     * warm-up starts.
+     */
     boolean isMetalDrawEnabled() {
-        return this.metalDrawEnabled;
+        boolean enabled = MagnesiumOptionPages.OPTIONS.isMetalDraw();
+        if (enabled && !this.metalDrawWasEnabled) {
+            this.captureDone = false;
+            this.firstDrawNano = 0L;
+        }
+        this.metalDrawWasEnabled = enabled;
+        return enabled;
     }
 
     boolean isMetalCaptureDone() {
@@ -189,7 +199,8 @@ public final class MagnesiumRenderDevice implements RenderDevice {
      * Opens the offscreen Metal capture for the current tessellation. Supplies
      * the model-view-projection matrix (the chunk shader's
      * {@code u_ProjectionMatrix * u_ModelViewMatrix}, column-major) and the
-     * framebuffer size. No-op if a capture is already open or complete.
+     * framebuffer size. Only opens at the start of a frame (the solid pass),
+     * after the warm-up delay, and once the atlas and light map are mirrored.
      */
     void openMetalCapture(int width, int height, float[] mvp) {
         if (this.captureOpen || this.captureDone) {
@@ -198,26 +209,54 @@ public final class MagnesiumRenderDevice implements RenderDevice {
         if (this.tessVertexMetal == 0L || this.tessIndexMetal == 0L) {
             return;
         }
+        long now = System.nanoTime();
+        if (this.firstDrawNano == 0L) {
+            this.firstDrawNano = now;
+        }
+        if (MagnesiumPassHook.kind() != MagnesiumPassHook.SOLID
+                || now - this.firstDrawNano < MagnesiumOptionPages.OPTIONS.getCaptureDelaySeconds() * 1_000_000_000L) {
+            return;
+        }
+        if (!MagnesiumTextureSync.sync()) {
+            return;
+        }
+        MetalBridge.setChunkCulling(MagnesiumOptionPages.OPTIONS.isCullBackFaces());
         if (MetalBridge.beginChunkCapture(width, height, mvp)) {
             this.captureOpen = true;
-            this.captureStartNano = System.nanoTime();
+            this.captureStartNano = now;
+            MagnesiumPassHook.pushPassState();
+        }
+    }
+
+    /** Called when Sodium starts drawing a terrain pass. */
+    void onPassBegin(int kind) {
+        if (!this.captureOpen) {
+            return;
+        }
+        if (kind == MagnesiumPassHook.SOLID
+                || System.nanoTime() - this.captureStartNano > CAPTURE_TIMEOUT_NANOS) {
+            // The frame wrapped (or never produced a translucent pass).
+            this.finishMetalCapture();
+            return;
+        }
+        MagnesiumPassHook.pushPassState();
+    }
+
+    /** Called when Sodium finishes drawing a terrain pass. */
+    void onPassEnd(int kind) {
+        if (this.captureOpen && kind == MagnesiumPassHook.TRANSLUCENT) {
+            this.finishMetalCapture();
         }
     }
 
     /**
-     * Ends the open capture once its accumulation window has elapsed: commits
-     * the Metal encoder, reads the offscreen render back, dumps a PNG, prints
-     * verification statistics, and latches the "done" flag so later passes are
-     * skipped. Called from {@code CommandList.flush()} between render passes.
+     * Commits the Metal encoder, reads the offscreen render back, dumps a PNG,
+     * prints verification statistics, and latches the "done" flag so later
+     * frames are skipped.
      */
-    void closeMetalCaptureIfOpen() {
-        if (!this.captureOpen) {
-            return;
-        }
-        if (System.nanoTime() - this.captureStartNano < CAPTURE_WINDOW_NANOS) {
-            return;
-        }
+    private void finishMetalCapture() {
         this.captureOpen = false;
+        this.captureDone = true;
         String pngPath = System.getProperty(
                 "magnesium.metal.draw.png",
                 new java.io.File(System.getProperty("user.dir"), "magnesium-metal.png").getPath());
@@ -230,7 +269,6 @@ public final class MagnesiumRenderDevice implements RenderDevice {
                     stats[3] / 1000, stats[4] / 1000, stats[5] / 1000,
                     pngPath);
         }
-        this.captureDone = true;
     }
 
     /**
