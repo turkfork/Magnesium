@@ -271,6 +271,14 @@ public final class MetalBridge {
     public static native int endChunkFrame();
 
     /**
+     * Commits the work encoded so far without waiting (zero-copy frames only),
+     * so the GPU can run the solid and cutout passes while the CPU continues.
+     *
+     * @return true if the first half was submitted
+     */
+    public static native boolean flushChunkFrame();
+
+    /**
      * Asks the next frame-mode capture to render into IOSurface-backed targets
      * that OpenGL can sample directly (no readback).
      */

@@ -10,7 +10,8 @@
 		"SodiumOptionsGUIMixin",
 		"SpriteTickerMixin",
 		"NativeImageMixin",
-		"LightTextureMixin"
+		"LightTextureMixin",
+		"TextureAtlasMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

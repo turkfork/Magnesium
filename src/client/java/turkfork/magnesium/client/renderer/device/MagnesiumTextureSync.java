@@ -32,7 +32,6 @@ final class MagnesiumTextureSync {
     private static int atlasId = -1;
     private static int atlasWidth = -1;
     private static int atlasHeight = -1;
-    private static int atlasLevels = 1;
     private static boolean forceRemirror = false;
     private static int lightWidth = -1;
     private static int lightHeight = -1;
@@ -113,7 +112,6 @@ final class MagnesiumTextureSync {
         }
 
         atlasId = id;
-        atlasLevels = levels;
         MagnesiumAtlasDirty.enabled = true;
         forceRemirror = false;
         atlasWidth = width;

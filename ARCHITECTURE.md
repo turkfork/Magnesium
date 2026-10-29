@@ -124,8 +124,18 @@ CAMetalLayer drawable and reproduce depth/blend/cull state per pass.
    culling, `GlAbstractTessellation.bindAttributes()` redirection, atlas re-sync on
    resource reload.
 
-3. **Milestone 3:** Own the CAMetalLayer as the final frame target; reproduce depth /
-   blend / cull per `RenderLayer`; mirror `glViewport` + swap.
+3. **Milestone 3 (in progress):** Own the frame. Done so far: per-frame rendering with a
+   zero-copy hand-off (Metal renders color plus a packed 24-bit depth into two
+   IOSurfaces that OpenGL samples directly), split command-buffer submission (solid and
+   cutout are committed as soon as they finish, so only the translucent pass is waited
+   on), CPU-side capture of animated sprites and the light map (no GL readbacks),
+   atlas re-sync on resource reload, back-face culling, and automatic fallback to
+   OpenGL terrain when Metal fails or an Iris shader pack is active.
+   Still open: presenting through a `CAMetalLayer`. Entities, sky and UI are still
+   drawn by OpenGL into the window framebuffer, so Metal can only own the final frame
+   once those are drawn by Metal as well (or composited into the Metal frame);
+   until then the terrain is composited into OpenGL's framebuffer. `glViewport` and
+   swap mirroring belong to that step.
 
 4. **Milestone 4:** Textures (atlas as `MTLTexture`), fences/pacing, and residency.
 

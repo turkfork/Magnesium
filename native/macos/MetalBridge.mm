@@ -312,6 +312,15 @@ static IOSurfaceRef magnesiumSurfaceColor = NULL;
 static IOSurfaceRef magnesiumSurfaceDepth = NULL;
 static id<MTLTexture> magnesiumCapAux = nil;
 
+/*
+ * Split submission (zero-copy frames only): the solid and cutout passes are
+ * committed as soon as they finish so the GPU works while the CPU builds the
+ * rest of the frame. The translucent pass continues in a second command buffer
+ * that loads the same attachments, and endChunkFrame waits only on that one.
+ */
+static BOOL magnesiumFrameSplit = NO;
+static id<MTLCommandBuffer> magnesiumFirstHalf = nil;
+
 static IOSurfaceRef MagnesiumCreateSurface(NSUInteger w, NSUInteger h) {
     NSDictionary *props = @{
         (id)kIOSurfaceWidth: @(w),
@@ -605,6 +614,35 @@ static void MagnesiumApplyPassState(void) {
     [magnesiumCapEncoder setVertexTexture:magnesiumLightTexture atIndex:1];
 }
 
+/* Opens the continuation encoder after the first half was committed. */
+static BOOL MagnesiumReopenEncoder(void) {
+    if (!magnesiumFrameSplit) {
+        return NO;
+    }
+    if (magnesiumCapEncoder != nil) {
+        return YES;
+    }
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = magnesiumCapColor;
+    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[1].texture = magnesiumCapAux;
+    pass.colorAttachments[1].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[1].storeAction = MTLStoreActionStore;
+    pass.depthAttachment.texture = magnesiumCapDepth;
+    pass.depthAttachment.loadAction = MTLLoadActionLoad;
+    pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+    magnesiumCapCommandBuffer = [magnesiumCommandQueue commandBuffer];
+    magnesiumCapEncoder = [magnesiumCapCommandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (magnesiumCapEncoder == nil) {
+        return NO;
+    }
+    [magnesiumCapEncoder setFrontFacingWinding:MTLWindingCounterClockwise];
+    [magnesiumCapEncoder setCullMode:magnesiumCullBackFaces ? MTLCullModeBack : MTLCullModeNone];
+    MagnesiumApplyPassState();
+    return YES;
+}
+
 static void MagnesiumSetCapMatrices(const jfloat *mvp) {
     if (mvp != NULL) {
         memcpy(magnesiumCapMvp, mvp, sizeof(magnesiumCapMvp));
@@ -614,6 +652,8 @@ static void MagnesiumSetCapMatrices(const jfloat *mvp) {
 static void MagnesiumResetCaptureState(void) {
     magnesiumCapEncoder = nil;
     magnesiumCapCommandBuffer = nil;
+    magnesiumFrameSplit = NO;
+    magnesiumFirstHalf = nil;
     magnesiumCaptureOpen = NO;
     magnesiumCapIndices = 0;
     magnesiumCapSubDraws = 0;
@@ -1114,6 +1154,8 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_beginChunkCapture(
         if (magnesiumCapEncoder != nil) {
             [magnesiumCapEncoder endEncoding];
         }
+        magnesiumFrameSplit = NO;
+        magnesiumFirstHalf = nil;
 
         MTLRenderPassDescriptor *pass =
             [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1187,6 +1229,9 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_drawChunkBatch(
     jfloat oz
 ) {
     @autoreleasepool {
+        if (magnesiumCaptureOpen && magnesiumCapEncoder == nil) {
+            MagnesiumReopenEncoder();
+        }
         if (!magnesiumCaptureOpen ||
             magnesiumCapEncoder == nil ||
             elementCount <= 0 ||
@@ -1343,35 +1388,59 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_drawChunkBatch(
             }
         }
 
+        /* Sodium emits one draw per visible face range of a section. Ranges that are
+         * adjacent in the arena (next base == this base + its quads * 4 vertices) and
+         * share the quad index buffer produce exactly the same triangles as one
+         * larger draw, so merge them to cut the number of encoded draw calls. */
+        const NSUInteger indexStride = (indexType == MTLIndexTypeUInt16) ? 2u : 4u;
+        int32_t runBase = 0;
+        int64_t runCount = 0;
+        auto emit = [&]() {
+            if (runCount <= 0) {
+                return;
+            }
+            /* Never encode a draw that reads outside the mirrors: Sodium's batches are
+             * quad lists, so the highest vertex touched is base + (count / 6) * 4. */
+            uint64_t indexBytes = (uint64_t)runCount * indexStride;
+            uint64_t vertexEnd = ((uint64_t)(runBase < 0 ? 0 : runBase) + (uint64_t)(runCount / 6) * 4u) * 20u;
+            if (runBase < 0 || indexBytes > indexBuffer.length || vertexEnd > vertexBuffer.length) {
+                if (magnesiumSkippedDraws++ < 5) {
+                    NSLog(@"[Magnesium] skipped out-of-range draw: count=%lld base=%d "
+                          "(index mirror %lu bytes, vertex mirror %lu bytes)",
+                          (long long)runCount, runBase, (unsigned long)indexBuffer.length,
+                          (unsigned long)vertexBuffer.length);
+                }
+            } else {
+                [magnesiumCapEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                                indexCount:(NSUInteger)runCount
+                                                 indexType:indexType
+                                               indexBuffer:indexBuffer
+                                         indexBufferOffset:0
+                                             instanceCount:1
+                                                baseVertex:runBase
+                                              baseInstance:0];
+                magnesiumCapIndices += (uint64_t)runCount;
+            }
+            runCount = 0;
+        };
+
         for (int i = 0; i < elementCount; i++) {
             int32_t count = counts[i];
             int32_t base = bases[i];
             if (count <= 0) {
                 continue;
             }
-            /* Never encode a draw that reads outside the mirrors: Sodium's batches are
-             * quad lists, so the highest vertex touched is base + (count / 6) * 4. */
-            uint64_t indexBytes = (uint64_t)count * (indexType == MTLIndexTypeUInt16 ? 2u : 4u);
-            uint64_t vertexEnd = ((uint64_t)(base < 0 ? 0 : base) + (uint64_t)(count / 6) * 4u) * 20u;
-            if (base < 0 || indexBytes > indexBuffer.length || vertexEnd > vertexBuffer.length) {
-                if (magnesiumSkippedDraws++ < 5) {
-                    NSLog(@"[Magnesium] skipped out-of-range draw: count=%d base=%d "
-                          "(index mirror %lu bytes, vertex mirror %lu bytes)",
-                          count, base, (unsigned long)indexBuffer.length,
-                          (unsigned long)vertexBuffer.length);
-                }
+            if (runCount > 0 && (runCount % 6) == 0 && (count % 6) == 0 &&
+                (int64_t)base == (int64_t)runBase + (runCount / 6) * 4 &&
+                runCount + count < INT32_MAX) {
+                runCount += count;
                 continue;
             }
-            [magnesiumCapEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                            indexCount:count
-                                             indexType:indexType
-                                           indexBuffer:indexBuffer
-                                     indexBufferOffset:0
-                                         instanceCount:1
-                                            baseVertex:base
-                                          baseInstance:0];
-            magnesiumCapIndices += (uint64_t)count;
+            emit();
+            runBase = base;
+            runCount = count;
         }
+        emit();
         magnesiumCapSubDraws += elementCount;
     }
 }
@@ -1396,53 +1465,87 @@ Java_turkfork_magnesium_client_renderer_MetalBridge_endChunkFrame(
     jclass clazz
 ) {
     @autoreleasepool {
+        BOOL haveTail = (magnesiumCapEncoder != nil && magnesiumCapCommandBuffer != nil);
+        BOOL haveHead = (magnesiumFrameSplit && magnesiumFirstHalf != nil);
         if (!magnesiumCaptureOpen ||
-            magnesiumCapEncoder == nil ||
-            magnesiumCapCommandBuffer == nil ||
+            (!haveTail && !haveHead) ||
             (!magnesiumZeroCopyActive &&
              (magnesiumFrameColorBuf == nil || magnesiumFrameDepthBuf == nil))) {
             MagnesiumResetCaptureState();
             return 0;
         }
 
-        [magnesiumCapEncoder endEncoding];
+        id<MTLCommandBuffer> last = magnesiumFirstHalf;
+        if (haveTail) {
+            [magnesiumCapEncoder endEncoding];
 
-        NSUInteger w = magnesiumCapWidth;
-        NSUInteger h = magnesiumCapHeight;
-        if (!magnesiumZeroCopyActive) {
-        id<MTLBlitCommandEncoder> blit = [magnesiumCapCommandBuffer blitCommandEncoder];
-        [blit copyFromTexture:magnesiumCapColor
-                  sourceSlice:0
-                  sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(w, h, 1)
-                     toBuffer:magnesiumFrameColorBuf
-            destinationOffset:0
-       destinationBytesPerRow:w * 4
-     destinationBytesPerImage:w * h * 4];
-        [blit copyFromTexture:magnesiumCapDepth
-                  sourceSlice:0
-                  sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(w, h, 1)
-                     toBuffer:magnesiumFrameDepthBuf
-            destinationOffset:0
-       destinationBytesPerRow:w * 4
-     destinationBytesPerImage:w * h * 4
-                      options:MTLBlitOptionDepthFromDepthStencil];
-        [blit endEncoding];
+            NSUInteger w = magnesiumCapWidth;
+            NSUInteger h = magnesiumCapHeight;
+            if (!magnesiumZeroCopyActive) {
+                id<MTLBlitCommandEncoder> blit = [magnesiumCapCommandBuffer blitCommandEncoder];
+                [blit copyFromTexture:magnesiumCapColor
+                          sourceSlice:0
+                          sourceLevel:0
+                         sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(w, h, 1)
+                             toBuffer:magnesiumFrameColorBuf
+                    destinationOffset:0
+               destinationBytesPerRow:w * 4
+             destinationBytesPerImage:w * h * 4];
+                [blit copyFromTexture:magnesiumCapDepth
+                          sourceSlice:0
+                          sourceLevel:0
+                         sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(w, h, 1)
+                             toBuffer:magnesiumFrameDepthBuf
+                    destinationOffset:0
+               destinationBytesPerRow:w * 4
+             destinationBytesPerImage:w * h * 4
+                              options:MTLBlitOptionDepthFromDepthStencil];
+                [blit endEncoding];
+            }
+            [magnesiumCapCommandBuffer commit];
+            last = magnesiumCapCommandBuffer;
         }
 
-        [magnesiumCapCommandBuffer commit];
-        [magnesiumCapCommandBuffer waitUntilCompleted];
+        /* Buffers on one queue execute in order, so the last one covers both halves. */
+        [last waitUntilCompleted];
 
-        BOOL ok = (magnesiumCapCommandBuffer.status == MTLCommandBufferStatusCompleted);
+        BOOL ok = (last.status == MTLCommandBufferStatusCompleted) &&
+                  (magnesiumFirstHalf == nil ||
+                   magnesiumFirstHalf.status == MTLCommandBufferStatusCompleted);
         if (!ok) {
             NSLog(@"[Magnesium] frame command buffer failed: %@",
-                  magnesiumCapCommandBuffer.error.localizedDescription);
+                  last.error.localizedDescription ?: magnesiumFirstHalf.error.localizedDescription);
         }
         MagnesiumResetCaptureState();
         return !ok ? 0 : (magnesiumZeroCopyActive ? 2 : 1);
+    }
+}
+
+/*
+ * Commits the work encoded so far without waiting (zero-copy frame mode only),
+ * so the GPU can start on the solid and cutout passes. Later draws continue in
+ * a second command buffer. Returns false if nothing was committed.
+ */
+JNIEXPORT jboolean JNICALL
+Java_turkfork_magnesium_client_renderer_MetalBridge_flushChunkFrame(
+    JNIEnv *env,
+    jclass clazz
+) {
+    @autoreleasepool {
+        if (!magnesiumCaptureOpen || !magnesiumFrameMode || !magnesiumZeroCopyActive ||
+            magnesiumFrameSplit || magnesiumCapEncoder == nil ||
+            magnesiumCapCommandBuffer == nil) {
+            return JNI_FALSE;
+        }
+        [magnesiumCapEncoder endEncoding];
+        [magnesiumCapCommandBuffer commit];
+        magnesiumFirstHalf = magnesiumCapCommandBuffer;
+        magnesiumCapEncoder = nil;
+        magnesiumCapCommandBuffer = nil;
+        magnesiumFrameSplit = YES;
+        return JNI_TRUE;
     }
 }
 

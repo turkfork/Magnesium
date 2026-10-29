@@ -28,6 +28,8 @@ public final class MagnesiumAtlasDirty {
     private static boolean overflow = false;
     private static ByteBuffer light = null;
 
+    private static boolean remirror = false;
+
     private MagnesiumAtlasDirty() {
     }
 
@@ -81,10 +83,16 @@ public final class MagnesiumAtlasDirty {
         return copy;
     }
 
+    /** Asks for the whole atlas to be mirrored again (after a resource reload). */
+    public static synchronized void requestRemirror() {
+        remirror = true;
+    }
+
     /** @return true once if tiles were dropped and the atlas must be mirrored again */
     static synchronized boolean takeOverflow() {
-        boolean o = overflow;
+        boolean o = overflow || remirror;
         overflow = false;
+        remirror = false;
         return o;
     }
 

@@ -55,6 +55,8 @@ public final class MagnesiumRenderDevice implements RenderDevice {
     private boolean metalDrawWasEnabled = false;
     private volatile boolean captureDone = false;
     private boolean captureOpen = false;
+    private int frameFailures = 0;
+    private static final int MAX_FRAME_FAILURES = 120;
     private boolean captureIsFrame = false;
     private int captureWidth = 0;
     private int captureHeight = 0;
@@ -189,11 +191,12 @@ public final class MagnesiumRenderDevice implements RenderDevice {
     }
 
     boolean isMetalRenderEnabled() {
-        return MagnesiumOptionPages.OPTIONS.isMetalRender();
+        return MagnesiumOptionPages.OPTIONS.isMetalRender() && !MagnesiumCompat.shaderPackActive();
     }
 
     boolean isOpenGlDrawDisabled() {
-        return MagnesiumOptionPages.OPTIONS.isDisableOpenGl();
+        return MagnesiumOptionPages.OPTIONS.isDisableOpenGl() && !MagnesiumCompat.shaderPackActive()
+                && MagnesiumOptionPages.OPTIONS.isMetalRender();
     }
 
     boolean isMetalCaptureDone() {
@@ -223,7 +226,7 @@ public final class MagnesiumRenderDevice implements RenderDevice {
         if (this.captureOpen) {
             return;
         }
-        boolean frame = MagnesiumOptionPages.OPTIONS.isMetalRender();
+        boolean frame = this.isMetalRenderEnabled();
         if (!frame && this.captureDone) {
             return;
         }
@@ -247,7 +250,11 @@ public final class MagnesiumRenderDevice implements RenderDevice {
         MetalBridge.setChunkFrameMode(frame);
         MetalBridge.setFrameZeroCopy(frame && MagnesiumGlComposite.zeroCopyAllowed());
         MetalBridge.setChunkCulling(MagnesiumOptionPages.OPTIONS.isCullBackFaces());
-        if (MetalBridge.beginChunkCapture(width, height, mvp)) {
+        boolean began = MetalBridge.beginChunkCapture(width, height, mvp);
+        if (frame && !began) {
+            this.recordFrameFailure("could not open the Metal frame");
+        }
+        if (began) {
             this.captureOpen = true;
             this.captureIsFrame = frame;
             this.captureWidth = width;
@@ -273,8 +280,14 @@ public final class MagnesiumRenderDevice implements RenderDevice {
 
     /** Called when Sodium finishes drawing a terrain pass. */
     void onPassEnd(int kind) {
-        if (this.captureOpen && kind == MagnesiumPassHook.TRANSLUCENT) {
+        if (!this.captureOpen) {
+            return;
+        }
+        if (kind == MagnesiumPassHook.TRANSLUCENT) {
             this.finishCurrentCapture();
+        } else if (kind == MagnesiumPassHook.CUTOUT && this.captureIsFrame) {
+            // Let the GPU start on solid + cutout while the CPU draws entities.
+            MetalBridge.flushChunkFrame();
         }
     }
 
@@ -292,19 +305,42 @@ public final class MagnesiumRenderDevice implements RenderDevice {
      */
     private void finishMetalFrame() {
         this.captureOpen = false;
-        int result = MetalBridge.endChunkFrame();
-        if (result == 2) {
-            if (!MagnesiumGlComposite.compositeZeroCopy()) {
-                // CGL could not bind the surfaces; use the readback path from now on.
-                MagnesiumGlComposite.disableZeroCopy();
+        try {
+            int result = MetalBridge.endChunkFrame();
+            if (result == 2) {
+                if (!MagnesiumGlComposite.compositeZeroCopy()) {
+                    // CGL could not bind the surfaces; use the readback path from now on.
+                    MagnesiumGlComposite.disableZeroCopy();
+                }
+            } else if (result == 1) {
+                MagnesiumGlComposite.composite(
+                        this.captureWidth,
+                        this.captureHeight,
+                        MetalBridge.frameBufferAddress(0),
+                        MetalBridge.frameBufferAddress(1));
+            } else {
+                this.recordFrameFailure("the Metal frame did not complete");
+                return;
             }
-        } else if (result == 1) {
-            MagnesiumGlComposite.composite(
-                    this.captureWidth,
-                    this.captureHeight,
-                    MetalBridge.frameBufferAddress(0),
-                    MetalBridge.frameBufferAddress(1));
+            this.frameFailures = 0;
+        } catch (Throwable t) {
+            this.recordFrameFailure("exception " + t);
         }
+    }
+
+    /**
+     * Counts consecutive failed frames. If Metal keeps failing, switch back to
+     * Sodium's OpenGL terrain so the world never goes invisible.
+     */
+    private void recordFrameFailure(String reason) {
+        if (++this.frameFailures < MAX_FRAME_FAILURES) {
+            return;
+        }
+        this.frameFailures = 0;
+        MagnesiumOptionPages.OPTIONS.setMetalRender(false);
+        MagnesiumOptionPages.OPTIONS.setDisableOpenGl(false);
+        System.err.println("[Magnesium] Metal terrain failed " + MAX_FRAME_FAILURES
+                + " frames in a row (" + reason + "); switched back to OpenGL terrain.");
     }
 
     /**

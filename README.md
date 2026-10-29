@@ -48,11 +48,13 @@ Sodium sends almost all of its OpenGL through three interfaces, `RenderDevice`, 
 | ✅ | Texture atlas (all mip levels) and light map, with animated water, lava and fire |
 | ✅ | Smooth fog, texture-coordinate shrink and back-face culling matching vanilla |
 | ✅ | Zero-copy hand-off to OpenGL through IOSurface, with a readback fallback |
+| ✅ | Solid and cutout work submitted to the GPU early, so the CPU only waits on the translucent pass |
+| ✅ | Falls back to OpenGL terrain on repeated Metal failures, and pauses while an Iris shader pack is active |
 | ✅ | Settings page inside Sodium's video options, plus a native macOS menu bar |
 | 🚧 | Presenting straight through a `CAMetalLayer` (Milestone 3) |
 | 🚧 | Faster than OpenGL |
 
-**How a frame works today.** Metal draws the terrain into an IOSurface-backed target, along with a packed 24-bit depth. OpenGL reads those surfaces and composites them into Minecraft's framebuffer, so entities, the sky, the UI and the terrain all sort correctly. The CPU still waits for the GPU once per frame, and that wait is why this isn't faster yet. Removing it means presenting through a `CAMetalLayer` and compositing everything else into that frame.
+**How a frame works today.** Metal draws the terrain into an IOSurface-backed target, along with a packed 24-bit depth. OpenGL reads those surfaces and composites them into Minecraft's framebuffer, so entities, the sky, the UI and the terrain all sort correctly. The solid and cutout passes are submitted to the GPU as soon as they finish, but the CPU still waits for the translucent pass once per frame, and that wait is why this isn't faster yet. Removing it means presenting through a `CAMetalLayer` and compositing everything else into that frame.
 
 ## Requirements
 

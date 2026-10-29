@@ -19,7 +19,6 @@ import me.jellysquid.mods.sodium.client.gl.util.EnumBitField;
 import turkfork.magnesium.client.renderer.MetalBridge;
 
 import java.nio.ByteBuffer;
-import java.util.IdentityHashMap;
 import java.util.Map;
 
 /**

@@ -1,7 +1,6 @@
 package turkfork.magnesium.client;
 
 import net.fabricmc.api.ClientModInitializer;
-import turkfork.magnesium.client.renderer.MagnesiumDeviceInstaller;
 import turkfork.magnesium.client.renderer.MagnesiumRenderer;
 
 public class MagnesiumClient implements ClientModInitializer {
